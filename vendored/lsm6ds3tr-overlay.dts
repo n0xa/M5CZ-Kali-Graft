@@ -1,0 +1,21 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2835";
+    
+    fragment@0 {
+        target = <&i2c1>;
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+            
+            lsm6ds3: imu@6a {
+                compatible = "st,lsm6ds3tr-c";
+                reg = <0x6a>;
+                status = "okay";
+            };
+        };
+    };
+};

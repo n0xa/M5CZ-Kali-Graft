@@ -1,0 +1,20 @@
+# Large binary inputs/outputs live alongside graft.sh but are never tracked.
+*.img
+*.img.xz
+*.img.zip
+*.img.gz
+*.img.zst
+*.deb
+
+# Fetched-and-verified upstream tarballs (e.g. zeroclaw release archives).
+# Each is pinned by SHA in graft.sh; the cache is just a build-time speedup.
+/cache/
+
+# Mount points / loop artifacts a previous run may have left in CWD.
+/mnt/
+
+# Editor + OS scratch
+*.swp
+*~
+.DS_Store
+Thumbs.db

@@ -1,0 +1,1510 @@
+#!/usr/bin/env bash
+# graft.sh — assemble a Kali arm64 image that runs APPLaunch on the M5 Cardputer Zero LCD.
+#
+# Stages (run any subset; default is "all"):
+#   check     | verify host tooling + input images exist
+#   donor     | fetch + decompress the OEM CZ image (skip if CZ_IMG present)
+#   unxz      | decompress Kali base .xz (skip if .img exists)
+#   resize    | grow Kali rootfs by $GROW_GB (skip if already grown)
+#   mount     | loop-attach + mount both images (CZ ro, Kali rw)
+#   boot      | transplant kernel/dtb/overlays + write merged config.txt/cmdline.txt/user-data
+#   rootfs    | copy CZ kernel modules + CM0 BCM firmware blobs
+#   applaunch | install APPLaunch from the donor's .deb (carefully — see /lib symlink note)
+#   verify    | sanity-check the result
+#   shell     | mount everything and drop into an interactive bash for tinkering
+#   fresh     | delete the current .img so the next run starts from .xz
+#
+# Examples:
+#   sudo ./graft.sh                            # run everything (will fetch OEM donor on first run)
+#   sudo ./graft.sh boot verify                # re-do just the boot partition + verify
+#   sudo ./graft.sh shell                      # mount + interactive subshell
+#   sudo CZ_HOSTNAME=cz-test ./graft.sh boot   # custom hostname
+#   sudo APPLAUNCH_DEB=/path/to/new.deb ./graft.sh applaunch  # swap APPLaunch build
+#   sudo CZ_IMG=/path/to/CardputerZero.img ./graft.sh         # use a field-customized donor
+#
+# Environment overrides (defaults resolve against the script dir; large
+# binary inputs/outputs live alongside graft.sh and are ignored by git):
+#   CZ_IMG          path to decompressed donor .img (default: $SCRIPT_DIR/cardputerzero-trixie-arm64-latest.img)
+#   CZ_XZ           path to donor .img.xz (default: $SCRIPT_DIR/cardputerzero-trixie-arm64-latest.img.xz)
+#   CZ_URL          URL to fetch CZ_XZ from if absent (default: M5Stack OSS bucket)
+#   KALI_XZ         path to kali-…-arm64.img.xz source (default: $SCRIPT_DIR/kali-linux-2026.1-raspberry-pi-arm64.img.xz)
+#   OUT_IMG         path to the produced .img (defaults to KALI_XZ minus .xz)
+#   APPLAUNCH_DEB   path to applaunch_*.deb (defaults: most recent $SCRIPT_DIR/applaunch_*.deb, else donor's bundled one)
+#   LAUNCHER_SRC    path to the M5CardputerZero-Launcher source tree (default: $SCRIPT_DIR/M5CardputerZero-Launcher, then $SCRIPT_DIR/../M5CardputerZero-Launcher)
+#   CZ_HOSTNAME     hostname to set in cloud-init user-data (default: cardputerzero-kali)
+#   GROW_GB         extra GiB to add to rootfs (default: 4)
+
+set -euo pipefail
+
+# ─── Paths & defaults ────────────────────────────────────────────────────────
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# Donor: M5Stack's OEM CardputerZero OS image (Debian Trixie arm64).
+# Anyone can reproduce from a known-good baseline by letting graft.sh fetch
+# the .img.xz from M5Stack's OSS bucket. To use a hand-modified donor (e.g.
+# a dd of a tinkered-on CZ SD card), override CZ_IMG.
+CZ_URL="${CZ_URL:-https://cardputer-zero-repo.oss-cn-shenzhen.aliyuncs.com/cardputerzero-trixie-arm64-latest.img.xz}"
+CZ_XZ="${CZ_XZ:-$SCRIPT_DIR/cardputerzero-trixie-arm64-latest.img.xz}"
+CZ_IMG="${CZ_IMG:-${CZ_XZ%.xz}}"
+
+KALI_XZ="${KALI_XZ:-$SCRIPT_DIR/kali-linux-2026.1-raspberry-pi-arm64.img.xz}"
+OUT_IMG="${OUT_IMG:-${KALI_XZ%.xz}}"
+
+# zeroclaw — Apache-2.0 AI agent CLI from https://github.com/zeroclaw-labs/zeroclaw.
+# APPLaunch's Claw app shells out to /home/pi/zeroclaw, but the binary doesn't
+# ship with M5Stack's OEM image — beta testers are expected to install it.
+# Pinned version + SHA so the build is reproducible; bump as needed.
+ZEROCLAW_VER="${ZEROCLAW_VER:-v0.7.5}"
+ZEROCLAW_TGZ_NAME="zeroclaw-aarch64-unknown-linux-gnu.tar.gz"
+ZEROCLAW_URL="${ZEROCLAW_URL:-https://github.com/zeroclaw-labs/zeroclaw/releases/download/${ZEROCLAW_VER}/${ZEROCLAW_TGZ_NAME}}"
+ZEROCLAW_SHA256="${ZEROCLAW_SHA256:-0b1197f1d80243e5c748b63a550cc6dfc37e407c4d15f729b32324ba9fe4c2ac}"
+ZEROCLAW_CACHE="${ZEROCLAW_CACHE:-$SCRIPT_DIR/cache/$ZEROCLAW_TGZ_NAME}"
+
+CZ_HOSTNAME="${CZ_HOSTNAME:-cardputerzero-kali}"
+GROW_GB="${GROW_GB:-4}"
+
+CZ_BOOT=/mnt/cz_boot
+CZ_ROOT=/mnt/cz_root
+KALI_BOOT=/mnt/kali_boot
+KALI_ROOT=/mnt/kali_root
+
+CZ_LOOP=""
+KALI_LOOP=""
+
+# ─── Output helpers ──────────────────────────────────────────────────────────
+if [[ -t 2 ]]; then
+    C_INFO=$'\033[1;34m'; C_WARN=$'\033[1;33m'; C_ERR=$'\033[1;31m'
+    C_OK=$'\033[1;32m';   C_DIM=$'\033[2m';      C_RST=$'\033[0m'
+else
+    C_INFO= C_WARN= C_ERR= C_OK= C_DIM= C_RST=
+fi
+log()  { echo "${C_INFO}[*]${C_RST} $*"  >&2; }
+ok()   { echo "${C_OK}[✓]${C_RST} $*"    >&2; }
+warn() { echo "${C_WARN}[!]${C_RST} $*"  >&2; }
+err()  { echo "${C_ERR}[X]${C_RST} $*"   >&2; exit 1; }
+dim()  { echo "${C_DIM}    $*${C_RST}"   >&2; }
+
+# ─── Pre-flight ──────────────────────────────────────────────────────────────
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log "Re-executing under sudo..."
+        exec sudo -E "$BASH" "$0" "$@"
+    fi
+}
+
+require_cmds() {
+    local missing=()
+    for c in "$@"; do command -v "$c" >/dev/null || missing+=("$c"); done
+    [[ ${#missing[@]} -eq 0 ]] || err "Missing tools: ${missing[*]}"
+}
+
+# Fetch (with SHA-pinned cache), verify, and extract zeroclaw into <pi_home>.
+# Idempotent — bails early if /home/pi/zeroclaw is already there.
+install_zeroclaw() {
+    local pi_home="$1"
+    if [[ -x "$pi_home/zeroclaw" ]]; then
+        ok "/home/pi/zeroclaw already installed — skipping"
+        return
+    fi
+
+    mkdir -p "$(dirname "$ZEROCLAW_CACHE")"
+    if [[ ! -f "$ZEROCLAW_CACHE" ]] || ! echo "$ZEROCLAW_SHA256  $ZEROCLAW_CACHE" | sha256sum -c --status; then
+        log "Fetching zeroclaw $ZEROCLAW_VER from $ZEROCLAW_URL"
+        curl -L --fail --progress-bar -o "$ZEROCLAW_CACHE.part" "$ZEROCLAW_URL"
+        mv "$ZEROCLAW_CACHE.part" "$ZEROCLAW_CACHE"
+    fi
+    echo "$ZEROCLAW_SHA256  $ZEROCLAW_CACHE" | sha256sum -c --status \
+        || err "zeroclaw SHA256 mismatch ($ZEROCLAW_CACHE) — refusing to install"
+
+    # Tarball layout: ./zeroclaw + ./web/dist/... — extract everything to /home/pi
+    log "Extracting zeroclaw $ZEROCLAW_VER → $pi_home"
+    tar -xzf "$ZEROCLAW_CACHE" -C "$pi_home"
+    chown -R 1000:1000 "$pi_home/zeroclaw" "$pi_home/web" 2>/dev/null || true
+    chmod 755 "$pi_home/zeroclaw"
+    ok "Installed /home/pi/zeroclaw + web assets (Claw applet)"
+}
+
+# ─── Cleanup ─────────────────────────────────────────────────────────────────
+unmount_all() {
+    for m in "$KALI_ROOT" "$KALI_BOOT" "$CZ_ROOT" "$CZ_BOOT"; do
+        if mountpoint -q "$m" 2>/dev/null; then
+            umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
+        fi
+    done
+}
+detach_loops() {
+    # Detach any loops backing our image files (resilient even after a crash)
+    for img in "$CZ_IMG" "$OUT_IMG"; do
+        [[ -f "$img" ]] || continue
+        while read -r loop; do
+            [[ -n "$loop" ]] && losetup -d "$loop" 2>/dev/null || true
+        done < <(losetup -j "$img" 2>/dev/null | cut -d: -f1)
+    done
+    CZ_LOOP=""; KALI_LOOP=""
+}
+cleanup() { unmount_all; detach_loops; }
+trap cleanup EXIT
+
+# ─── Stages ──────────────────────────────────────────────────────────────────
+
+stage_check() {
+    log "Checking dependencies"
+    require_cmds xz parted partprobe e2fsck resize2fs blkid losetup ar tar zstd mountpoint truncate curl
+    # Donor: stage_donor handles fetch/decompress, so we just need to know
+    # *something* about the donor is resolvable from here (file present, .xz
+    # present, or URL provided so we can fetch).
+    if [[ ! -f "$CZ_IMG" && ! -f "$CZ_XZ" && -z "${CZ_URL:-}" ]]; then
+        err "No CZ donor available: set CZ_IMG, place CZ_XZ at $CZ_XZ, or leave CZ_URL set"
+    fi
+    [[ -f "$KALI_XZ" || -f "$OUT_IMG" ]] || err "Kali source missing: $KALI_XZ and $OUT_IMG"
+    ok "Dependencies + inputs OK"
+    dim "CZ donor:  $CZ_IMG"
+    dim "CZ xz:     $CZ_XZ"
+    dim "Kali xz:   $KALI_XZ"
+    dim "Out img:   $OUT_IMG"
+    dim "Hostname:  $CZ_HOSTNAME"
+}
+
+stage_donor() {
+    if [[ -f "$CZ_IMG" ]]; then
+        ok "$(basename "$CZ_IMG") already present — skipping donor fetch"
+        return
+    fi
+    if [[ ! -f "$CZ_XZ" ]]; then
+        log "Fetching donor image: $CZ_URL"
+        curl -L --fail --progress-bar -o "$CZ_XZ.part" "$CZ_URL"
+        mv "$CZ_XZ.part" "$CZ_XZ"
+        ok "Downloaded: $(du -h "$CZ_XZ" | cut -f1)"
+    fi
+    log "Decompressing $(basename "$CZ_XZ")"
+    xz -d -k -T 0 "$CZ_XZ"
+    ok "Decompressed: $(du -h "$CZ_IMG" | cut -f1)"
+}
+
+stage_unxz() {
+    if [[ -f "$OUT_IMG" ]]; then
+        ok "$(basename "$OUT_IMG") already present — skipping unxz"
+        return
+    fi
+    log "Decompressing $(basename "$KALI_XZ")"
+    xz -d -k -T 0 "$KALI_XZ"
+    ok "Decompressed: $(du -h "$OUT_IMG" | cut -f1)"
+}
+
+stage_resize() {
+    local current_size_gb
+    current_size_gb=$(($(stat -c%s "$OUT_IMG") / 1024 / 1024 / 1024))
+    if (( current_size_gb >= 18 )); then
+        ok "Image already $current_size_gb GiB — skipping resize"
+        return
+    fi
+    log "Growing image by $GROW_GB GiB (current: $current_size_gb GiB)"
+    truncate -s +"${GROW_GB}G" "$OUT_IMG"
+    local loop
+    loop=$(losetup -fP --show "$OUT_IMG")
+    parted --script "$loop" resizepart 2 100%
+    partprobe "$loop"
+    e2fsck -f -y "${loop}p2" || true
+    resize2fs "${loop}p2"
+    losetup -d "$loop"
+    ok "Resized to $(($(stat -c%s "$OUT_IMG") / 1024 / 1024 / 1024)) GiB"
+}
+
+stage_mount() {
+    # Idempotent: if already mounted, no-op
+    if mountpoint -q "$KALI_ROOT" && mountpoint -q "$CZ_ROOT"; then
+        ok "Already mounted"
+        # Recover loop names from /proc/mounts for downstream stages
+        CZ_LOOP=$(findmnt -no SOURCE "$CZ_ROOT"   | sed 's/p[0-9]*$//')
+        KALI_LOOP=$(findmnt -no SOURCE "$KALI_ROOT" | sed 's/p[0-9]*$//')
+        return
+    fi
+    log "Loop-attaching and mounting"
+    mkdir -p "$CZ_BOOT" "$CZ_ROOT" "$KALI_BOOT" "$KALI_ROOT"
+
+    CZ_LOOP=$(losetup -fP --show --read-only "$CZ_IMG")
+    KALI_LOOP=$(losetup -fP --show "$OUT_IMG")
+
+    mount -o ro            "${CZ_LOOP}p1"   "$CZ_BOOT"
+    mount -o ro,noload     "${CZ_LOOP}p2"   "$CZ_ROOT"
+    mount                  "${KALI_LOOP}p1" "$KALI_BOOT"
+    mount                  "${KALI_LOOP}p2" "$KALI_ROOT"
+    ok "Mounted: cz=$CZ_LOOP kali=$KALI_LOOP"
+}
+
+stage_boot() {
+    log "Boot-partition transplant"
+
+    # Backup originals (idempotent — don't clobber existing .kali)
+    for f in kernel8.img bcm2710-rpi-cm0.dtb config.txt cmdline.txt; do
+        [[ -f "$KALI_BOOT/$f.kali" ]] || cp -a "$KALI_BOOT/$f" "$KALI_BOOT/$f.kali"
+    done
+
+    cp -a "$CZ_BOOT/kernel8.img"         "$KALI_BOOT/"
+    cp -a "$CZ_BOOT/bcm2710-rpi-cm0.dtb" "$KALI_BOOT/"
+
+    # cardputerzero-overlay.dtbo ships with the OEM donor.
+    cp -a "$CZ_BOOT/overlays/cardputerzero-overlay.dtbo" "$KALI_BOOT/overlays/"
+
+    # lsm6ds3tr overlay is NOT in the OEM image (M5 ships it as DTS source
+    # you build on-device). We carry a pre-built .dtbo in vendored/. The
+    # in-tree st_lsm6dsx driver binds it. (`install` instead of `cp -a` —
+    # exfat→FAT32 ownership preservation silently fails with cp -a.)
+    #
+    # No bq27220 overlay: the chip has no in-tree Linux driver, and the
+    # out-of-tree binary we used to vendor came from an undocumented build
+    # (GPL source unavailable). APPLaunch talks to the chip directly via
+    # /dev/i2c-1 — see stage_configs for the i2c-dev autoload.
+    for ov in lsm6ds3tr-overlay.dtbo; do
+        if [[ -f "$CZ_BOOT/overlays/$ov" ]]; then
+            install -m644 "$CZ_BOOT/overlays/$ov" "$KALI_BOOT/overlays/$ov"
+        else
+            install -m644 "$SCRIPT_DIR/vendored/$ov" "$KALI_BOOT/overlays/$ov"
+        fi
+    done
+
+    write_config_txt
+    write_cmdline_txt
+    write_user_data
+    ok "Boot partition ready"
+}
+
+write_config_txt() {
+    log "Writing config.txt (Kali base + CZ overlays + Pi-Tail dwc2)"
+    cat > "$KALI_BOOT/config.txt" <<'CONFIG'
+# Cardputer Zero on Kali — merged config.txt
+# Original Kali base preserved as config.txt.kali.
+# Boots CZ's M5-patched 6.12.75 kernel directly via the GPU firmware
+# loader (no u-boot chain — the OEM image runs the same way).
+
+dtparam=i2c_arm=on
+dtparam=i2s=on
+dtparam=spi=on
+dtparam=audio=off
+
+camera_auto_detect=0
+dtoverlay=imx219
+display_auto_detect=1
+
+auto_initramfs=1
+dtoverlay=vc4-kms-v3d
+max_framebuffers=2
+disable_fw_kms_setup=1
+arm_64bit=1
+disable_overscan=1
+arm_boost=1
+
+[cm4]
+otg_mode=1
+
+[cm5]
+dtoverlay=dwc2,dr_mode=host
+
+[all]
+enable_uart=1
+
+# Cardputer Zero carrier-board overlays
+dtoverlay=cardputerzero-overlay
+dtoverlay=lsm6ds3tr-overlay
+
+# IR receiver + transmitter (per CZ stock config)
+dtoverlay=gpio-ir,gpio_pin=13,gpio_pull=up
+dtoverlay=pwm-ir-tx,gpio_pin=12,func=4
+
+# USB OTG (gadget mode) — for later Pi-Tail USB-Ethernet
+dtoverlay=dwc2
+CONFIG
+}
+
+write_cmdline_txt() {
+    local partuuid
+    partuuid=$(blkid -s PARTUUID -o value "${KALI_LOOP}p2")
+    log "Writing cmdline.txt with PARTUUID=$partuuid"
+    # 'quiet' silences kernel chatter on tty1.
+    # 'consoleblank=0' disables the 10-min auto-blank — small device, we don't
+    #     want the kernel blanking fbcon and dragging APPLaunch's redraws along.
+    # 'fbcon=map:99' tells the framebuffer console to attach itself to /dev/fb99
+    #     which never exists. Without this, when HDMI is unplugged the LCD
+    #     becomes fb0 and the kernel auto-binds fbcon to it, painting kernel
+    #     messages + cursor over APPLaunch. We tried a userspace unbind service
+    #     (`disable-fbcon.service`) but it racey-ran before the st7789v module
+    #     registered the fb, missed it, and the kernel rebound automatically.
+    #     map:99 is the only race-free fix. Side effect: HDMI text console is
+    #     no longer visible — use SSH or lightdm/X for HDMI shells.
+    cat > "$KALI_BOOT/cmdline.txt" <<CMDLINE
+console=serial0,115200 console=tty1 root=PARTUUID=${partuuid} rootfstype=ext4 fsck.repair=yes rootwait quiet fbcon=map:99 consoleblank=0 modules-load=dwc2
+CMDLINE
+}
+
+write_user_data() {
+    log "Writing cloud-init user-data (hostname=$CZ_HOSTNAME, ssh on)"
+    cat > "$KALI_BOOT/user-data" <<YAML
+#cloud-config
+# vim: syntax=yaml
+
+hostname: $CZ_HOSTNAME
+manage_etc_hosts: true
+
+users:
+  - default
+
+ssh_pwauth: true
+package_upgrade: false
+
+runcmd:
+  - [ systemctl, enable, ssh ]
+  - [ systemctl, start, ssh ]
+YAML
+}
+
+stage_rootfs() {
+    log "Rootfs transplant: modules + firmware"
+
+    # Kernel modules. Kali is usrmerged so the canonical path is /usr/lib/modules.
+    local mod_src="$CZ_ROOT/lib/modules/6.12.75+rpt-rpi-v8"
+    local mod_dst="$KALI_ROOT/usr/lib/modules/6.12.75+rpt-rpi-v8"
+    local rebuild_depmod=0
+    if [[ -d "$mod_dst" ]]; then
+        ok "Modules dir already present — skipping (delete it to force re-copy)"
+    else
+        [[ -d "$mod_src" ]] || err "CZ modules dir missing: $mod_src"
+        cp -a "$mod_src" "$KALI_ROOT/usr/lib/modules/"
+        ok "Copied $(du -sh "$mod_dst" | cut -f1) of modules"
+        rebuild_depmod=1
+    fi
+
+    if (( rebuild_depmod )); then
+        log "Rebuilding modules.dep (depmod) for 6.12.75+rpt-rpi-v8"
+        depmod -b "$KALI_ROOT" 6.12.75+rpt-rpi-v8
+    fi
+
+    # CM0-specific Broadcom firmware (brcm/ tree)
+    log "Copying CM0-specific Broadcom firmware blobs (brcm/)"
+    for f in \
+        brcmfmac43430-sdio.raspberrypi,0-compute-module.bin \
+        brcmfmac43430-sdio.raspberrypi,0-compute-module.txt \
+        brcmfmac43436s-sdio.raspberrypi,0-compute-module.bin \
+        brcmfmac43436s-sdio.raspberrypi,0-compute-module.txt \
+        brcmfmac43439-sdio.raspberrypi,0-compute-module.bin \
+        brcmfmac43439-sdio.raspberrypi,0-compute-module.clm_blob \
+        brcmfmac43439-sdio.raspberrypi,0-compute-module.txt
+    do
+        [[ -f "$CZ_ROOT/lib/firmware/brcm/$f" ]] && \
+            cp -a "$CZ_ROOT/lib/firmware/brcm/$f" "$KALI_ROOT/usr/lib/firmware/brcm/"
+    done
+
+    # Cypress firmware (cypress/) — load-bearing for BCM43439.
+    # The brcm/ entries above are symlinks into ../cypress/. Kali's stock cypress/
+    # dir is missing several of the targets, leaving dangling symlinks. More
+    # importantly, the cyfmac43439-sdio.txt NVRAM Kali ships has
+    # boardflags3=0x08000000 (wrong for CZ); donor has 0x04000000 which is what
+    # the chip actually needs to bring up its HT clock. Without the donor's
+    # NVRAM the chip wedges with "HT Avail timeout" and wlan0 never appears.
+    # See memory: project_wifi_nvram_boardflags3.
+    log "Copying Cypress firmware (cypress/) — includes CZ-specific NVRAM for BCM43439"
+    for f in \
+        cyfmac43439-sdio.bin \
+        cyfmac43439-sdio.clm_blob \
+        cyfmac43439-sdio.txt
+    do
+        if [[ -f "$CZ_ROOT/lib/firmware/cypress/$f" ]]; then
+            cp -af "$CZ_ROOT/lib/firmware/cypress/$f" "$KALI_ROOT/usr/lib/firmware/cypress/"
+        fi
+    done
+
+    # Symlink the missing CM0 .clm_blob → generic cypress blob
+    local clm="$KALI_ROOT/usr/lib/firmware/brcm/brcmfmac43430-sdio.raspberrypi,0-compute-module.clm_blob"
+    if [[ ! -e "$clm" ]]; then
+        ln -sf ../cypress/cyfmac43430-sdio.clm_blob "$clm"
+    fi
+
+    # Hostname (cloud-init handles it too, but be belt-and-braces)
+    echo "$CZ_HOSTNAME" > "$KALI_ROOT/etc/hostname"
+    ok "Rootfs transplant done"
+}
+
+stage_applaunch() {
+    log "Installing APPLaunch"
+
+    local deb="${APPLAUNCH_DEB:-}"
+    if [[ -z "$deb" ]]; then
+        # Prefer the most recent locally-built .deb (from stage_launcher_build);
+        # fall back to the donor's bundled one.
+        deb=$(ls -t "$SCRIPT_DIR"/applaunch_*_arm64.deb 2>/dev/null | head -1 || true)
+        if [[ -z "$deb" ]]; then
+            deb=$(ls "$CZ_ROOT/home/pi/"applaunch_*_arm64.deb 2>/dev/null | head -1 || true)
+        fi
+    fi
+    [[ -f "$deb" ]] || err "APPLaunch .deb not found (set APPLAUNCH_DEB env var or run launcher-build)"
+    dim "From: $deb"
+
+    # /home/pi helper binaries — install independently of the .deb step so they
+    # land on re-runs even if APPLaunch itself is already in place. APPLaunch
+    # ships hardcoded /home/pi/... paths for its terminal apps (Claw, Calculator,
+    # racer, roller485); the OEM image ships an empty /home/pi and these are
+    # end-user-installed externals.
+    install -d -m755 -o 1000 -g 1000 "$KALI_ROOT/home/pi"
+    # Camera app writes captures to /home/pi/Pictures/IMX219_*.jpg —
+    # pre-create the directory so writes don't ENOENT. (Still useless
+    # until the IMX219 -EREMOTEIO upstream defect is resolved, but the
+    # path is ready when it is.)
+    install -d -m755 -o 1000 -g 1000 "$KALI_ROOT/home/pi/Pictures"
+    install_zeroclaw "$KALI_ROOT/home/pi"
+
+    if [[ -x "$KALI_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch" \
+       && -L "$KALI_ROOT/etc/systemd/system/multi-user.target.wants/APPLaunch.service" ]]; then
+        ok "APPLaunch already installed + enabled — skipping (rm /usr/share/APPLaunch to force)"
+        return
+    fi
+
+    local work
+    work=$(mktemp -d)
+    cp "$deb" "$work/applaunch.deb"
+    ( cd "$work" && ar x applaunch.deb )
+
+    mkdir -p "$work/payload"
+    # Compression varies: donor's .deb is zstd, our local-built one is xz (dpkg-deb default).
+    # `tar -xaf` auto-detects by file magic.
+    data_archive=$(ls "$work"/data.tar.* | head -1)
+    [[ -n "$data_archive" ]] || err "no data.tar.* found in .deb"
+    tar -xaf "$data_archive" -C "$work/payload"
+
+    # CRITICAL: /lib in Kali is a symlink → usr/lib. GNU tar refuses to extract
+    # through symlinks (CVE-2018-20482 hardening). If we let tar drop directly
+    # into $KALI_ROOT it'd replace /lib with a real directory — boot-fatal.
+    # So extract to a tmpdir first, then manually map /lib/* → /usr/lib/*.
+    if [[ -d "$work/payload/lib" ]]; then
+        cp -a "$work/payload/lib/." "$KALI_ROOT/usr/lib/"
+        rm -rf "$work/payload/lib"
+    fi
+    cp -a "$work/payload/." "$KALI_ROOT/"
+    rm -rf "$work"
+
+    # Replicate the .deb postinst manually (no chroot needed)
+    mkdir -p "$KALI_ROOT/var/cache/APPLaunch"
+    rm -rf "$KALI_ROOT/usr/share/APPLaunch/cache"
+    ln -s /var/cache/APPLaunch "$KALI_ROOT/usr/share/APPLaunch/cache"
+
+    # systemctl enable equivalent
+    mkdir -p "$KALI_ROOT/etc/systemd/system/multi-user.target.wants"
+    ln -sf /lib/systemd/system/APPLaunch.service \
+        "$KALI_ROOT/etc/systemd/system/multi-user.target.wants/APPLaunch.service"
+
+    # Drop-in: wait for udev to populate /dev/input/by-path symlinks before
+    # APPLaunch starts. Without this, APPLaunch races udev — opens the keypad
+    # via the missing by-path symlink, libinput returns ENOENT, and the
+    # keypad is silently lost for the whole session.
+    mkdir -p "$KALI_ROOT/etc/systemd/system/APPLaunch.service.d"
+    cat > "$KALI_ROOT/etc/systemd/system/APPLaunch.service.d/wait-for-udev.conf" <<'EOF'
+[Unit]
+After=systemd-udev-settle.service multi-user.target
+Wants=systemd-udev-settle.service
+
+[Service]
+ExecStartPre=/bin/sh -c "for i in 1 2 3 4 5 6 7 8 9 10; do [ -e /dev/input/by-path/platform-3f804000.i2c-event ] && exit 0; sleep 1; done; exit 0"
+EOF
+
+    ok "APPLaunch installed + service enabled"
+}
+
+stage_configs() {
+    log "Writing static configs (glycin env, fbcon disable, X input ignore, lightdm, /etc/skel)"
+
+    # System-wide glycin sandbox bypass. The CM0's kernel / Pi userland combo
+    # makes glycin's bwrap sandbox crash on every icon load (status 127/139)
+    # which assert-kills any Gtk app. Bypassing the sandbox is the only known
+    # workaround until upstream glycin fixes its aarch64 seccomp filter.
+    mkdir -p "$KALI_ROOT/etc/environment.d"
+    cat > "$KALI_ROOT/etc/environment.d/glycin-nosandbox.conf" <<'EOF'
+GLYCIN_SANDBOX_MECHANISM=not-sandboxed
+EOF
+    mkdir -p "$KALI_ROOT/etc/profile.d"
+    cat > "$KALI_ROOT/etc/profile.d/glycin-nosandbox.sh" <<'EOF'
+export GLYCIN_SANDBOX_MECHANISM=not-sandboxed
+EOF
+    chmod 644 "$KALI_ROOT/etc/profile.d/glycin-nosandbox.sh"
+
+    # Also append to /etc/environment so pam_env propagates it into lightdm-
+    # autologin X sessions. environment.d / profile.d don't cover that path
+    # (systemd --user vs login shells respectively), and without the env in
+    # the session, pcmanfm-desktop fails to load the wallpaper JPEG via
+    # gdk-pixbuf's glycin backend (OutOfMemory) and the desktop is solid black.
+    if ! grep -q '^GLYCIN_SANDBOX_MECHANISM' "$KALI_ROOT/etc/environment" 2>/dev/null; then
+        echo 'GLYCIN_SANDBOX_MECHANISM=not-sandboxed' >> "$KALI_ROOT/etc/environment"
+    fi
+
+    # Disable X screen blanking + DPMS — this device is always-on or HDMI-
+    # demo-attached; we don't want a 10-minute black screen surprising users.
+    # `xset` lines have no leading `@` so lxsession runs them once (not respawned
+    # like the persistent daemons). Done as a separate file under lxsession.d so
+    # we don't fight the Kali package's autostart contents.
+    mkdir -p "$KALI_ROOT/etc/xdg/lxsession/LXDE"
+    cat > "$KALI_ROOT/etc/xdg/lxsession/LXDE/autostart" <<'EOF'
+@lxpanel --profile LXDE
+@pcmanfm --desktop --profile LXDE
+xset s off
+xset -dpms
+xset s noblank
+EOF
+
+    # fbcon is fully suppressed via the kernel cmdline `fbcon=map:99` in
+    # write_cmdline_txt — that's race-free against st7789v_m5stack binding
+    # after our userspace runs. No userspace service needed; clean up any
+    # legacy disable-fbcon.service from older builds so it doesn't show as
+    # active-but-no-op.
+    rm -f "$KALI_ROOT/etc/systemd/system/disable-fbcon.service" \
+          "$KALI_ROOT/etc/systemd/system/basic.target.wants/disable-fbcon.service"
+
+    # Keep the integrated keypad + IR receiver out of X. Both APPLaunch (on the
+    # LCD) and X (on HDMI) try to libinput-grab the same evdev nodes; whichever
+    # gets there first wins, and APPLaunch loses every time. Tell X to ignore
+    # these two devices so the keypad/IR stay with APPLaunch and only USB
+    # peripherals (like the user's K400) drive the HDMI session.
+    mkdir -p "$KALI_ROOT/etc/X11/xorg.conf.d"
+    cat > "$KALI_ROOT/etc/X11/xorg.conf.d/40-cardputerzero-no-grab.conf" <<'EOF'
+# Cardputer Zero — keep integrated keypad + IR receiver out of X.
+# APPLaunch on the LCD owns them; X grabbing them steals input from the launcher.
+
+Section "InputClass"
+    Identifier "Cardputer Zero integrated keypad - ignore"
+    MatchProduct "tca8418c"
+    Option "Ignore" "on"
+EndSection
+
+Section "InputClass"
+    Identifier "Cardputer Zero IR receiver - ignore"
+    MatchProduct "gpio_ir_recv"
+    Option "Ignore" "on"
+EndSection
+EOF
+
+    # Disable V3D-accelerated 2D (glamor) on the Pi Zero 2 W. With glamor on,
+    # X tries to allocate tile-binning buffers from V3D's CMA pool and fails
+    # under load with "AddScreen/ScreenInit failed for driver 0" (the GEM DMA
+    # helper returns -ENOMEM even for the 4 MB scanout BO). Software shadow-fb
+    # is slower but the screen actually comes up.
+    cat > "$KALI_ROOT/etc/X11/xorg.conf.d/98-vc4-no-glamor.conf" <<'EOF'
+Section "Device"
+    Identifier "vc4-noaccel"
+    Driver "modesetting"
+    Option "AccelMethod" "none"
+    Option "ShadowFB" "true"
+EndSection
+EOF
+
+    # Expose i2c-1 to userspace. The bq27220 fuel gauge has no in-tree Linux
+    # driver, so we don't bind a kernel driver to it at all — APPLaunch reads
+    # the chip directly via /dev/i2c-1 with the correct bq27220 register map
+    # (see projects/APPLaunch/main/hal/linux/hal_settings_linux.cpp). Without
+    # this, /dev/i2c-1 is missing at boot and APPLaunch falls through to no
+    # battery info at all.
+    mkdir -p "$KALI_ROOT/etc/modules-load.d"
+    cat > "$KALI_ROOT/etc/modules-load.d/i2c-dev.conf" <<'EOF'
+i2c-dev
+EOF
+
+    # zram swap config: 75% of RAM (~311 MB on the 415 MB CM0) compressed
+    # via zstd. Service is enabled in stage_packages after zram-tools lands.
+    # 50% was too tight — opening LXDE menus tipped the system over the edge.
+    cat > "$KALI_ROOT/etc/default/zramswap" <<'EOF'
+ALGO=zstd
+PERCENT=75
+PRIORITY=100
+EOF
+
+    # Lightdm: autologin kali → LXDE. Wins over any package-shipped configs.
+    mkdir -p "$KALI_ROOT/etc/lightdm/lightdm.conf.d"
+    cat > "$KALI_ROOT/etc/lightdm/lightdm.conf.d/lightdm-autologin-greeter.conf" <<'EOF'
+[Seat:*]
+autologin-user=kali
+autologin-session=LXDE
+user-session=LXDE
+greeter-session=lightdm-autologin-greeter
+EOF
+
+    # NOTE: We used to drop /etc/skel/.config/pcmanfm/LXDE/desktop-items-0.conf
+    # here, but that file is per-monitor-item state, NOT the wallpaper source
+    # pcmanfm-desktop actually reads at startup. The real wallpaper setting
+    # lives in /etc/xdg/pcmanfm/LXDE/pcmanfm.conf [desktop] section — which
+    # is part of the pcmanfm package, so we patch it in stage_packages after
+    # the package lands. See https://wiki.archlinux.org/title/PCManFM
+
+    # Lightdm autostarts LXDE on HDMI (enabled in stage_packages). tty1's getty
+    # autologin is the fallback if lightdm is masked or fails. The fbcon=map:99
+    # cmdline still suppresses the kernel framebuffer console on both outputs
+    # so APPLaunch owns the LCD cleanly.
+    mkdir -p "$KALI_ROOT/etc/systemd/system/getty@tty1.service.d"
+    cat > "$KALI_ROOT/etc/systemd/system/getty@tty1.service.d/autologin.conf" <<'EOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin kali --noclear %I $TERM
+Type=idle
+EOF
+
+    # dbus.service WorkingDirectory drop-in. systemd 259+ chdirs to the User='s
+    # home dir when WorkingDirectory= isn't set. dbus runs as User=messagebus
+    # whose home is /nonexistent → systemd exits 200/CHDIR → dbus never starts
+    # → polkit, NetworkManager, systemd-timesyncd, lightdm-autologin-greeter
+    # all cascade-fail. WorkingDirectory=/ forces a sane working dir.
+    mkdir -p "$KALI_ROOT/etc/systemd/system/dbus.service.d"
+    cat > "$KALI_ROOT/etc/systemd/system/dbus.service.d/workdir.conf" <<'EOF'
+[Service]
+WorkingDirectory=/
+EOF
+
+    ok "Static configs staged"
+}
+
+# ── stage_packages: chroot into the rootfs and apt-install the desktop stack ──
+#
+# Requires qemu-user-static + qemu-user-static-binfmt on the host, and
+# systemd-binfmt to have registered /proc/sys/fs/binfmt_misc/qemu-aarch64
+# with the F (fix-binary) flag so the interpreter survives chroot.
+stage_packages() {
+    log "Installing desktop stack via qemu-user-static chroot"
+
+    [[ -x /usr/bin/qemu-aarch64-static ]] \
+        || err "qemu-aarch64-static not installed. Run: sudo pacman -S qemu-user-static qemu-user-static-binfmt"
+    [[ -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]] \
+        || err "binfmt_misc qemu-aarch64 not registered. Try: sudo systemctl restart systemd-binfmt"
+
+    # Sentinel: skip if EVERYTHING this stage installs is already present
+    # (LXDE + autologin greeter + libcamera + ffmpeg + gpiod + the
+    # pre-baked kali user). We can't just check LXDE binaries — earlier
+    # versions of this stage didn't bake some of these, and we'd silently
+    # skip them on a re-run.
+    if [[ -x "$KALI_ROOT/usr/bin/lxsession" \
+       && -x "$KALI_ROOT/usr/lib/lightdm-autologin-greeter/lightdm-autologin-greeter" \
+       && -f "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera.so.0.7" \
+       && -x "$KALI_ROOT/usr/bin/ffmpeg" \
+       && -x "$KALI_ROOT/usr/bin/gpioset" \
+       && -f "$KALI_ROOT/home/kali/.ssh/authorized_keys" ]] \
+       && grep -q '^kali:' "$KALI_ROOT/etc/passwd"; then
+        ok "Desktop packages + kali user + SSH key all present — skipping"
+        return
+    fi
+
+    # Save resolv.conf state so we can restore image-neutral after the chroot.
+    # File-scope (not local) so the cleanup helper sees them on RETURN trap.
+    CHROOT_RESOLV="$KALI_ROOT/etc/resolv.conf"
+    CHROOT_RESOLV_WAS_SYMLINK=false
+    [[ -L "$CHROOT_RESOLV" ]] && CHROOT_RESOLV_WAS_SYMLINK=true
+    cp -f /etc/resolv.conf "$CHROOT_RESOLV"
+
+    mount --bind /dev     "$KALI_ROOT/dev"
+    mount --bind /dev/pts "$KALI_ROOT/dev/pts"
+    mount -t proc proc    "$KALI_ROOT/proc"
+    mount -t sysfs sysfs  "$KALI_ROOT/sys"
+
+    # Cleanup on any exit path. Unmounts in reverse order + restores
+    # resolv.conf. Idempotent — outer cleanup() trap will also try to unmount
+    # but mountpoint -q will see them as gone.
+    chroot_cleanup() {
+        umount -l "$KALI_ROOT/sys"     2>/dev/null || true
+        umount -l "$KALI_ROOT/proc"    2>/dev/null || true
+        umount -l "$KALI_ROOT/dev/pts" 2>/dev/null || true
+        umount -l "$KALI_ROOT/dev"     2>/dev/null || true
+        if [[ "${CHROOT_RESOLV_WAS_SYMLINK:-false}" == "true" ]]; then
+            rm -f "$CHROOT_RESOLV"
+            ln -sf /run/systemd/resolve/stub-resolv.conf "$CHROOT_RESOLV" 2>/dev/null || \
+            ln -sf /etc/resolvconf/run/resolv.conf "$CHROOT_RESOLV" 2>/dev/null || \
+            : > "$CHROOT_RESOLV"
+        elif [[ -f "${CHROOT_RESOLV:-}" ]]; then
+            : > "$CHROOT_RESOLV"
+        fi
+    }
+    trap chroot_cleanup RETURN
+
+    chroot "$KALI_ROOT" /usr/bin/env -i \
+        DEBIAN_FRONTEND=noninteractive \
+        HOME=/root \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        LC_ALL=C \
+        bash -e <<'CHROOT'
+apt-get update
+apt-get install -y --no-install-recommends \
+    -o Dpkg::Options::="--force-confold" \
+    -o Dpkg::Options::="--force-confdef" \
+    zram-tools \
+    lxde-core \
+    lightdm-autologin-greeter \
+    feh \
+    libcamera0.7 \
+    ffmpeg \
+    gpiod
+
+# Pre-create the kali user with password 'kali' instead of relying on
+# cloud-init. Kali's stock Pi image is cloud-init-based — datasource setup
+# depends on /boot/firmware/user-data being read BEFORE filesystems are
+# mounted, which doesn't always happen reliably. Pre-baking avoids the
+# whole class of "user doesn't exist yet at boot" failures (agetty autologin
+# loop, sshd rejecting kali, APPLaunch fail to find /home/kali, etc).
+if ! getent passwd kali >/dev/null; then
+    useradd -m -G sudo,users,audio,video,plugdev,netdev -s /bin/bash kali
+fi
+echo 'kali:kali' | chpasswd
+echo 'kali ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/kali-nopasswd
+chmod 440 /etc/sudoers.d/kali-nopasswd
+
+# NOTE: SSH authorized_keys are NOT baked into the image. The image stays
+# generic/shareable (no personal credentials). Use `graft.sh deploy-ssh
+# /dev/sdX` AFTER flashing to drop your pubkey on a specific card.
+# Pre-create the .ssh dir with right perms so post-flash deploy is a one-liner.
+install -d -m700 -okali -gkali /home/kali/.ssh
+
+# Boot to graphical.target so display-manager.service (alias for lightdm)
+# actually starts at boot. lightdm's [Install] section only declares
+# WantedBy=graphical.target — a plain `systemctl enable lightdm` against
+# multi-user.target as default goes nowhere (the sysv-install fallback
+# fires, creates rc?.d symlinks, but systemd never pulls the unit). With
+# graphical.target as default the display-manager.service symlink is
+# honored and HDMI lights up automatically.
+#
+# APPLaunch on the LCD still owns the integrated keypad (Xorg ignores it
+# via 40-cardputerzero-no-grab.conf), so HDMI session is for USB
+# peripherals only. Costs ~50-80 MB at idle on the 415 MB usable CM0 —
+# measured 164 MB free with desktop up, well above the thrashing zone.
+systemctl set-default graphical.target
+systemctl enable lightdm
+systemctl enable zramswap
+
+# pigpio is not packaged in Kali rolling (security posture — it relies on
+# direct /dev/mem access). The launcher's GPIO app calls `pigs prs/pfs/p`,
+# which require pigpiod + pigs. Those commands silently fail at runtime;
+# the GPIO app's PWM tab won't drive anything. Documented in README under
+# "Known upstream defects". Future fix: build pigpio from source, or port
+# the GPIO app to libgpiod (which we install via the `gpiod` apt package).
+
+# Hold the load-bearing kernel/bootloader/firmware packages. Kali is rolling
+# and users routinely `apt upgrade` to refresh security tools — but that drags
+# in upgrades to raspi-firmware (replaces our M5-patched /boot/firmware/
+# kernel8.img + bcm2710-rpi-cm0.dtb), firmware-misc-nonfree / kali-linux-firmware
+# (replaces our CZ-specific Cypress NVRAM), and the linux-image-rpi-* metas
+# (would bring a different kernel version that doesn't match our out-of-tree
+# st7789v_m5stack.ko, tca8418_keypad_m5stack.ko, etc.). Any of those bricks
+# the LCD; raspi-firmware alone bricks boot.
+#
+# To intentionally upgrade one of these (e.g. M5Stack publishes a refreshed
+# kernel), `sudo apt-mark unhold <pkg>; sudo apt install <pkg>` then re-hold.
+apt-mark hold \
+    raspi-firmware \
+    firmware-misc-nonfree \
+    firmware-linux \
+    firmware-linux-nonfree \
+    kali-linux-firmware \
+    linux-image-rpi-v8 \
+    linux-image-rpi-2712
+
+# ── Memory diet: disable autostart bloat (~110 MB savings on the 415 MB CM0)
+# Each unwanted .desktop gets a "Hidden=true" line appended, which suppresses
+# the autostart per the FreeDesktop spec.
+for f in \
+    blueman.desktop \
+    orca-autostart.desktop \
+    onboard-autostart.desktop \
+    geoclue-demo-agent.desktop \
+    print-applet.desktop \
+    polkit-mate-authentication-agent-1.desktop \
+    xiccd.desktop \
+    xcape-super-key-bind.desktop \
+    org.gnome.SettingsDaemon.DiskUtilityNotify.desktop \
+    xfce4-clipman-plugin-autostart.desktop \
+    xfce4-notifyd.desktop \
+    xfce4-power-manager.desktop \
+    xfce4-screensaver.desktop \
+    xfsettingsd.desktop \
+    xfce-disable-motherboard-beep.desktop \
+    pkcs11-register.desktop \
+    gnome-keyring-pkcs11.desktop \
+    gnome-keyring-secrets.desktop; do
+    p=/etc/xdg/autostart/"$f"
+    [ -f "$p" ] && ! grep -q "^Hidden=true" "$p" && echo "Hidden=true" >> "$p"
+done
+
+# Mask bluetooth daemon (saves ~10 MB; user can unmask if they actually need BT)
+systemctl mask bluetooth.service
+
+# Override pcmanfm-desktop's wallpaper at the system-default level
+# (/etc/xdg/pcmanfm/LXDE/pcmanfm.conf [desktop] section). The package default
+# points at /etc/alternatives/desktop-background — which is a symlink chain
+# pcmanfm-desktop fails to render on startup (silently falls back to solid
+# black). Direct path avoids the alternatives indirection entirely.
+PCMANFM_CONF=/etc/xdg/pcmanfm/LXDE/pcmanfm.conf
+if [ -f "$PCMANFM_CONF" ]; then
+    sed -i 's|^wallpaper=.*|wallpaper=/usr/share/backgrounds/kali/kali-glitch-16x9.jpg|' "$PCMANFM_CONF"
+fi
+
+# Default x-session-manager → LXDE (not XFCE). Affects `startx` from a tty
+# login, lightdm's default greeter session pick, etc. Kali installs both
+# desktop environments; xfce wins the alternative by default, but our
+# default desktop is LXDE.
+if [ -x /usr/bin/startlxde ]; then
+    update-alternatives --set x-session-manager /usr/bin/startlxde 2>/dev/null || true
+fi
+
+# /etc/skel/.xsession: makes startx start LXDE for anyone newly-created
+# via useradd -m (cloud-init or otherwise) without needing per-user shell access.
+cat > /etc/skel/.xsession <<'EOF'
+exec startlxde
+EOF
+chmod 755 /etc/skel/.xsession
+
+# Also stamp the kali user's home (created earlier in this same chroot run)
+cp /etc/skel/.xsession /home/kali/.xsession
+chown kali:kali /home/kali/.xsession
+chmod 755 /home/kali/.xsession
+
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+
+# Defensive: something in the chroot install (or our prior surgery) has been
+# known to leave / at mode 700 in the resulting image, which prevents any
+# non-root setuid traversal — every User= service fails with libselinux.so.1
+# / EACCES cascades. Explicitly restore critical dir perms.
+chmod 755 / /usr /usr/bin /usr/sbin /usr/lib /lib /etc /var /var/lib /run /home 2>/dev/null || true
+# /tmp must be 1777 (sticky world-writable) — apt's _apt user mkstemp's here
+# during package downloads, and so does /usr/bin/install -d for many .debs.
+# A bare `chmod 755 /tmp` silently breaks the chroot's apt step on the next
+# build with "Unable to mkstemp /tmp/apt.sig.* - GetTempFile (13: Permission
+# denied)".
+chmod 1777 /tmp 2>/dev/null || true
+CHROOT
+
+    ok "Desktop stack installed"
+}
+
+# ── stage_launcher_build (opt-in): build APPLaunch from upstream + cache .deb ─
+#
+# Mounts the in-progress Kali rootfs as a qemu chroot, installs build
+# dependencies, runs scons against M5CardputerZero-Launcher/projects/APPLaunch,
+# and packages the dist/ output as a real .deb at
+#   $SCRIPT_DIR/applaunch_0.1-cz1+g<short-hash>_arm64.deb
+# Cached: if the .deb for the current source HEAD already exists, skip the
+# rebuild. Force with LAUNCHER_REBUILD=1.
+#
+# stage_applaunch will prefer the most-recent locally-built .deb over the
+# donor's, unless APPLAUNCH_DEB is set explicitly.
+stage_launcher_build() {
+    log "Launcher build (opt-in)"
+
+    # The launcher tree may live alongside graft.sh, or one level up (the
+    # historical workspace layout). Caller may override via LAUNCHER_SRC.
+    local src="${LAUNCHER_SRC:-}"
+    if [[ -z "$src" ]]; then
+        for candidate in "$SCRIPT_DIR/M5CardputerZero-Launcher" "$SCRIPT_DIR/../M5CardputerZero-Launcher"; do
+            [[ -d "$candidate/projects/APPLaunch" ]] && { src="$candidate"; break; }
+        done
+    fi
+    [[ -n "$src" && -d "$src/projects/APPLaunch" ]] \
+        || err "Launcher source not found (looked in \$LAUNCHER_SRC, $SCRIPT_DIR/M5CardputerZero-Launcher, $SCRIPT_DIR/../M5CardputerZero-Launcher)"
+
+    require_cmds qemu-aarch64-static git
+
+    # Use git short hash as the cache key. If source isn't a git tree, fall
+    # back to a timestamp (won't dedupe but won't break).
+    local commit
+    if commit=$(git -C "$src" rev-parse --short HEAD 2>/dev/null); then :; else commit=$(date +%Y%m%d%H%M%S); fi
+    local deb_name="applaunch_0.1-cz1+g${commit}_arm64.deb"
+    local deb_path="$SCRIPT_DIR/$deb_name"
+
+    if [[ -f "$deb_path" && "${LAUNCHER_REBUILD:-0}" != "1" ]]; then
+        ok "Cached .deb already present: $deb_name (LAUNCHER_REBUILD=1 to force)"
+        return
+    fi
+
+    # We need a mounted Kali rootfs to chroot into. If stage_mount hasn't run,
+    # do it now (caller may invoke `launcher-build` standalone).
+    if ! mountpoint -q "$KALI_ROOT"; then
+        stage_check
+        stage_unxz
+        stage_resize
+        stage_mount
+    fi
+
+    # Bind kernel filesystems + resolv.conf for apt
+    CHROOT_RESOLV="$KALI_ROOT/etc/resolv.conf"
+    CHROOT_RESOLV_WAS_SYMLINK=false
+    [[ -L "$CHROOT_RESOLV" ]] && CHROOT_RESOLV_WAS_SYMLINK=true
+    cp -f /etc/resolv.conf "$CHROOT_RESOLV"
+    mount --bind /dev     "$KALI_ROOT/dev"
+    mount --bind /dev/pts "$KALI_ROOT/dev/pts"
+    mount -t proc proc    "$KALI_ROOT/proc"
+    mount -t sysfs sysfs  "$KALI_ROOT/sys"
+
+    # Bind source into chroot
+    mkdir -p "$KALI_ROOT/src"
+    mount --bind "$src" "$KALI_ROOT/src"
+
+    launcher_cleanup() {
+        umount -l "$KALI_ROOT/src"     2>/dev/null || true
+        umount -l "$KALI_ROOT/sys"     2>/dev/null || true
+        umount -l "$KALI_ROOT/proc"    2>/dev/null || true
+        umount -l "$KALI_ROOT/dev/pts" 2>/dev/null || true
+        umount -l "$KALI_ROOT/dev"     2>/dev/null || true
+        if [[ "${CHROOT_RESOLV_WAS_SYMLINK:-false}" == "true" ]]; then
+            rm -f "$CHROOT_RESOLV"
+            ln -sf /run/systemd/resolve/stub-resolv.conf "$CHROOT_RESOLV" 2>/dev/null || \
+            ln -sf /etc/resolvconf/run/resolv.conf "$CHROOT_RESOLV" 2>/dev/null || \
+            : > "$CHROOT_RESOLV"
+        elif [[ -f "${CHROOT_RESOLV:-}" ]]; then
+            : > "$CHROOT_RESOLV"
+        fi
+    }
+    trap launcher_cleanup RETURN
+
+    log "Installing build dependencies in chroot"
+    chroot "$KALI_ROOT" /usr/bin/env -i \
+        DEBIAN_FRONTEND=noninteractive HOME=/root \
+        PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+        bash -e <<'CHROOT'
+apt-get update -qq
+apt-get install -y --no-install-recommends \
+    -o Dpkg::Options::="--force-confold" \
+    build-essential scons python3-parse python3-tqdm \
+    git wget tar xz-utils ca-certificates dpkg-dev \
+    libjpeg-dev libpng-dev libfreetype-dev libfontconfig-dev \
+    libinput-dev libudev-dev libcamera-dev libcamera0.7 \
+    libdrm-dev libgbm-dev libgles-dev libegl-dev libsdl2-dev \
+    libasound2-dev libpulse-dev libssl-dev pkg-config cmake unzip
+CHROOT
+
+    log "Compiling launcher (chroot, qemu-emulated aarch64)"
+    chroot "$KALI_ROOT" /usr/bin/env -i \
+        DEBIAN_FRONTEND=noninteractive HOME=/root \
+        PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+        CardputerZero=y \
+        bash -e <<'CHROOT'
+# aarch64-linux-gnu-* symlinks → native binaries so CardputerZero=y's
+# cross-compile config still works
+mkdir -p /usr/local/bin
+for t in gcc g++ cpp ld ar strip ranlib nm objcopy objdump readelf as; do
+    [ -x /usr/bin/$t ] && ln -sf /usr/bin/$t /usr/local/bin/aarch64-linux-gnu-$t
+done
+
+cd /src/projects/APPLaunch
+# Pre-stage config_tmp.mk so the top SConstruct doesn't try to download static_lib
+mkdir -p build/config
+echo 'CONFIG_TOOLCHAIN_SYSROOT=""' > build/config/config_tmp.mk
+
+yes | scons -j$(nproc) 2>&1 | tail -8
+
+[ -x dist/M5CardputerZero-APPLaunch ] || { echo "BUILD FAILED: no binary at dist/"; exit 1; }
+strip --strip-unneeded dist/M5CardputerZero-APPLaunch
+ls -la dist/M5CardputerZero-APPLaunch
+
+# AppStore is a sibling scons project. The launcher's STORE rotor entry
+# spawns /usr/share/APPLaunch/bin/M5CardputerZero-AppStore; without this
+# step the binary is missing and clicking STORE silently bounces back to
+# the main menu. Mirrors the upstream CI workflow's "Build AppStore" +
+# "Copy AppStore into APPLaunch dist" jobs.
+if [ -d /src/projects/AppStore/main ]; then
+    cd /src/projects/AppStore
+    rm -rf build dist
+    mkdir -p build/config
+    # AppStore's SConstruct auto-writes this file with the full LV_USE_*
+    # config when CardputerZero=y, but only if the file doesn't exist. Pre-
+    # staging a minimal version (just CONFIG_TOOLCHAIN_SYSROOT) preempts the
+    # auto-stage and the resulting build hits `#error Unsupported display
+    # configuration` because LV_USE_LINUX_FBDEV isn't set. Write the FULL
+    # config ourselves — same flags the SConstruct would have written, plus
+    # blank SYSROOT to avoid the static_lib download.
+    cat > build/config/config_tmp.mk <<'MK'
+CONFIG_V9_5_LV_USE_LINUX_FBDEV=y
+CONFIG_V9_5_LV_DRAW_SW_ASM_NEON=y
+CONFIG_V9_5_LV_USE_DRAW_SW_ASM=1
+CONFIG_V9_5_LV_USE_EVDEV=y
+CONFIG_TOOLCHAIN_PREFIX="aarch64-linux-gnu-"
+CONFIG_TOOLCHAIN_SYSROOT=""
+MK
+    # Filter scons output to keep meaningful lines (warnings/errors and
+    # high-level progress); full output is verbose under -j.
+    yes | scons -j$(nproc) 2>&1 | grep -E "(error:|warning:|undefined reference|^CC |^LD |^scons:|FAIL)" || true
+    [ -x dist/M5CardputerZero-AppStore ] || { echo "BUILD FAILED: no AppStore binary at dist/"; exit 1; }
+    strip --strip-unneeded dist/M5CardputerZero-AppStore
+    ls -la dist/M5CardputerZero-AppStore
+
+    # Stage AppStore artifacts into APPLaunch's dist tree so they end up
+    # in the .deb in the right places (bin/, share/images/).
+    mkdir -p /src/projects/APPLaunch/dist/bin
+    cp dist/M5CardputerZero-AppStore /src/projects/APPLaunch/dist/bin/
+    cp appstore.py                   /src/projects/APPLaunch/dist/bin/
+    mkdir -p /src/projects/APPLaunch/dist/APPLaunch/share/images
+    cp share/images/store_wordmark.png \
+       share/images/store_arrow_left.png \
+       share/images/store_arrow_right.png \
+       share/images/store_arrow_up.png \
+       share/images/store_arrow_down.png \
+       /src/projects/APPLaunch/dist/APPLaunch/share/images/ 2>/dev/null || true
+else
+    echo "WARN: projects/AppStore submodule not initialized — STORE app will not work"
+fi
+CHROOT
+
+    log "Packaging .deb"
+    chroot "$KALI_ROOT" /usr/bin/env -i \
+        DEBIAN_FRONTEND=noninteractive HOME=/root \
+        PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+        DEB_VERSION="0.1-cz1+g${commit}" DEB_NAME="$deb_name" \
+        bash -e <<'CHROOT'
+WORK=$(mktemp -d)
+SRC=/src/projects/APPLaunch/dist
+
+# Filesystem layout
+install -d -m755 "$WORK/usr/share/APPLaunch/bin"
+install -m755 "$SRC/M5CardputerZero-APPLaunch" "$WORK/usr/share/APPLaunch/bin/"
+
+# AppStore (built by the previous chroot block; copied into APPLaunch's
+# dist/bin/ alongside the launcher). Optional — only install if present.
+if [ -x "$SRC/bin/M5CardputerZero-AppStore" ]; then
+    install -m755 "$SRC/bin/M5CardputerZero-AppStore" "$WORK/usr/share/APPLaunch/bin/"
+fi
+if [ -f "$SRC/bin/appstore.py" ]; then
+    install -m755 "$SRC/bin/appstore.py" "$WORK/usr/share/APPLaunch/bin/"
+fi
+
+# Share tree (applications/, lib/, share/, etc.)
+if [ -d "$SRC/APPLaunch" ]; then
+    cp -a "$SRC/APPLaunch/." "$WORK/usr/share/APPLaunch/"
+fi
+
+# Systemd unit. Note: Kali is usrmerged so /lib → /usr/lib, but per Debian
+# policy .deb places unit files under /lib/systemd/system; the symlink takes
+# care of routing at install time.
+install -d -m755 "$WORK/lib/systemd/system"
+cat > "$WORK/lib/systemd/system/APPLaunch.service" <<'EOF'
+[Unit]
+Description=APPLaunch Service
+
+[Service]
+ExecStart=/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch
+WorkingDirectory=/usr/share/APPLaunch
+Restart=always
+RestartSec=1
+StartLimitInterval=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# DEBIAN metadata
+install -d -m755 "$WORK/DEBIAN"
+cat > "$WORK/DEBIAN/control" <<EOF
+Package: applaunch
+Version: ${DEB_VERSION}
+Architecture: arm64
+Maintainer: CardputerZero local build <root@cardputerzero-kali>
+Section: utils
+Priority: optional
+Depends: libc6, libstdc++6, libcamera0.7, libjpeg62-turbo, libfreetype6, libinput10, libxkbcommon0, libudev1
+Description: M5 Cardputer Zero LCD application launcher
+ LVGL-based UI for the Cardputer Zero's onboard ST7789V display. Built from
+ upstream M5CardputerZero-Launcher source.
+EOF
+
+cat > "$WORK/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+mkdir -p /var/cache/APPLaunch
+[ -L /usr/share/APPLaunch/cache ] || ln -sf /var/cache/APPLaunch /usr/share/APPLaunch/cache
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable APPLaunch.service 2>/dev/null || true
+EOF
+chmod 755 "$WORK/DEBIAN/postinst"
+
+cat > "$WORK/DEBIAN/prerm" <<'EOF'
+#!/bin/sh
+set -e
+systemctl stop APPLaunch.service 2>/dev/null || true
+systemctl disable APPLaunch.service 2>/dev/null || true
+EOF
+chmod 755 "$WORK/DEBIAN/prerm"
+
+# Build the .deb (zstd is the default since dpkg 1.21)
+dpkg-deb --build --root-owner-group "$WORK" "/src/$DEB_NAME"
+ls -la "/src/$DEB_NAME"
+CHROOT
+
+    [[ -f "$src/$deb_name" ]] || err "Build produced no .deb at $src/$deb_name"
+
+    # Move the .deb out of the launcher source tree (which is /src in the chroot)
+    # into $SCRIPT_DIR alongside graft.sh.
+    if [[ "$src/$deb_name" != "$deb_path" ]]; then
+        mv "$src/$deb_name" "$deb_path"
+    fi
+    chown $(stat -c '%u:%g' "$SCRIPT_DIR") "$deb_path"
+
+    ok "Cached: $deb_name ($(du -h "$deb_path" | cut -f1))"
+}
+
+stage_tweaks() {
+    log "Post-install tweaks: NetworkManager, /etc/hosts, networking.service"
+
+    # 1. NetworkManager: switch ifupdown integration to "managed" so NM owns
+    #    eth0 at boot. Default is "managed=false", which leaves eth0 to
+    #    ifupdown — but ifupdown's networking.service times out on its own
+    #    lockfile at boot (USB-Ethernet enumerates too slowly to clear the
+    #    15s ifup window). Switching to NM-managed gets eth0 up at boot.
+    local nmconf="$KALI_ROOT/etc/NetworkManager/NetworkManager.conf"
+    if [[ -f "$nmconf" ]] && grep -q '^managed=false' "$nmconf"; then
+        [[ -f "$nmconf.kali" ]] || cp -a "$nmconf" "$nmconf.kali"
+        sed -i 's/^managed=false/managed=true/' "$nmconf"
+        ok "NM ifupdown integration → managed=true"
+    fi
+
+    # 2. Disable + mask networking.service (the legacy ifupdown unit that
+    #    times out at boot — NM does the work now).
+    ln -sf /dev/null "$KALI_ROOT/etc/systemd/system/networking.service"
+    rm -f "$KALI_ROOT/etc/systemd/system/network-online.target.wants/networking.service" \
+          "$KALI_ROOT/etc/systemd/system/multi-user.target.wants/networking.service"
+
+    # 3. /etc/hosts entry for the hostname (kills "sudo: unable to resolve host"
+    #    warnings that otherwise spam every sudo invocation).
+    local hosts="$KALI_ROOT/etc/hosts"
+    if ! grep -qE "^127\.0\.1\.1[[:space:]]+$CZ_HOSTNAME\b" "$hosts" 2>/dev/null; then
+        echo "127.0.1.1	$CZ_HOSTNAME" >> "$hosts"
+    fi
+
+    ok "Tweaks applied"
+}
+
+VERIFY_ERRS=0
+vfail() { warn "$1"; VERIFY_ERRS=$((VERIFY_ERRS+1)); }
+
+stage_verify() {
+    log "Verifying graft integrity"
+    VERIFY_ERRS=0
+
+    # /lib symlink (the landmine)
+    [[ -L "$KALI_ROOT/lib" ]] || vfail "/lib is not a symlink (usrmerge broken)"
+    [[ -L "$KALI_ROOT/lib/ld-linux-aarch64.so.1" ]] || vfail "ld-linux-aarch64.so.1 not reachable via /lib"
+
+    # Boot files (no u-boot.bin — we boot kernel8.img directly via the GPU loader,
+    # matching the OEM image.)
+    for f in kernel8.img bcm2710-rpi-cm0.dtb \
+             overlays/cardputerzero-overlay.dtbo \
+             overlays/lsm6ds3tr-overlay.dtbo; do
+        [[ -f "$KALI_BOOT/$f" ]] || vfail "missing boot file: $f"
+    done
+
+    # Configs reference our overlays
+    grep -q '^dtoverlay=cardputerzero-overlay' "$KALI_BOOT/config.txt" || vfail "cardputerzero-overlay not in config.txt"
+    ! grep -q '^kernel=u-boot.bin'             "$KALI_BOOT/config.txt" || vfail "stale kernel=u-boot.bin in config.txt (should boot kernel8.img directly)"
+    grep -q 'root=PARTUUID='                   "$KALI_BOOT/cmdline.txt" || vfail "cmdline.txt has no root=PARTUUID"
+
+    # bq27220: must NOT have an overlay, driver, or any sysfs binding. The chip
+    # has no in-tree Linux driver; APPLaunch reads it directly via /dev/i2c-1.
+    ! grep -q '^dtoverlay=bq27220'        "$KALI_BOOT/config.txt"                                    || vfail "stale dtoverlay=bq27220 in config.txt (no in-tree driver — remove it)"
+    [[ ! -f "$KALI_BOOT/overlays/bq27220.dtbo" ]]                                                    || vfail "stale bq27220.dtbo in /boot/overlays (no in-tree driver — remove it)"
+    [[ ! -f "$KALI_ROOT/usr/lib/modules/6.12.75+rpt-rpi-v8/kernel/drivers/power/supply/bq27xxx_battery.ko" ]] \
+        || vfail "stale bq27xxx_battery.ko in rootfs (out-of-tree binary, no GPL source — remove it)"
+
+    # /dev/i2c-1 autoload (APPLaunch's bq27220 reader needs it)
+    grep -qx 'i2c-dev' "$KALI_ROOT/etc/modules-load.d/i2c-dev.conf" 2>/dev/null \
+        || vfail "i2c-dev not in /etc/modules-load.d/i2c-dev.conf (APPLaunch will see no battery)"
+
+    # /etc/environment must carry GLYCIN_SANDBOX_MECHANISM so pam_env propagates
+    # it into lightdm X sessions (without it, pcmanfm fails to load the
+    # wallpaper JPEG via glycin and the LXDE desktop is solid black).
+    grep -q '^GLYCIN_SANDBOX_MECHANISM=not-sandboxed' "$KALI_ROOT/etc/environment" 2>/dev/null \
+        || vfail "GLYCIN_SANDBOX_MECHANISM missing from /etc/environment (LXDE wallpaper will be black)"
+
+    # LXDE autostart must disable X screen blanking + DPMS or HDMI goes dark
+    # after 10 min — bad demo material on an always-on or kiosk device.
+    grep -qE '^xset -dpms' "$KALI_ROOT/etc/xdg/lxsession/LXDE/autostart" 2>/dev/null \
+        || vfail "LXDE autostart missing 'xset -dpms' (HDMI will blank after 10 min)"
+
+    # graphical.target must be the default or display-manager (lightdm) never
+    # starts at boot — its [Install] only declares WantedBy=graphical.target.
+    [[ -L "$KALI_ROOT/etc/systemd/system/default.target" \
+       && "$(readlink "$KALI_ROOT/etc/systemd/system/default.target")" =~ graphical\.target$ ]] \
+        || vfail "default.target is not graphical.target (lightdm won't auto-start)"
+
+    # M5 modules
+    for mod in pwm_bl_m5stack es8389_m5stack st7789v_m5stack tca8418_keypad_m5stack py32ioexp; do
+        [[ -f "$KALI_ROOT/usr/lib/modules/6.12.75+rpt-rpi-v8/extra/$mod.ko" ]] \
+            || vfail "M5 module missing: $mod.ko"
+    done
+
+    # APPLaunch
+    [[ -x "$KALI_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch" ]] \
+        || vfail "APPLaunch binary missing"
+    [[ -L "$KALI_ROOT/etc/systemd/system/multi-user.target.wants/APPLaunch.service" ]] \
+        || vfail "APPLaunch.service not enabled (no symlink in multi-user.target.wants)"
+    [[ -f "$KALI_ROOT/etc/systemd/system/APPLaunch.service.d/wait-for-udev.conf" ]] \
+        || vfail "APPLaunch udev-wait drop-in missing (keypad will race udev and silently fail to grab)"
+
+    # CM0 WiFi firmware (the missing .clm_blob landmine)
+    [[ -e "$KALI_ROOT/usr/lib/firmware/brcm/brcmfmac43430-sdio.raspberrypi,0-compute-module.clm_blob" ]] \
+        || vfail "CM0 43430 .clm_blob missing or unresolved"
+
+    # BCM43439 NVRAM has the right boardflags3 (donor 0x04000000, not Kali default 0x08000000).
+    # The chip wedges with HT timeout on the wrong value — see project_wifi_nvram_boardflags3.
+    local nvram="$KALI_ROOT/usr/lib/firmware/cypress/cyfmac43439-sdio.txt"
+    if [[ -f "$nvram" ]]; then
+        grep -q '^boardflags3=0x04000000' "$nvram" \
+            || vfail "BCM43439 NVRAM has wrong boardflags3 (need 0x04000000 from donor)"
+    else
+        vfail "BCM43439 NVRAM cyfmac43439-sdio.txt missing"
+    fi
+
+    # cmdline.txt has 'quiet' so kernel logs don't clobber APPLaunch on LCD
+    grep -qw 'quiet' "$KALI_BOOT/cmdline.txt" \
+        || vfail "cmdline.txt missing 'quiet' (LCD will show kernel log spam over APPLaunch)"
+
+    # Desktop stack baked in (replaces the old firstboot-fetch approach)
+    [[ -x "$KALI_ROOT/usr/bin/lxsession" ]] \
+        || vfail "lxsession not installed (stage_packages didn't run or failed)"
+    [[ -x "$KALI_ROOT/usr/lib/lightdm-autologin-greeter/lightdm-autologin-greeter" ]] \
+        || vfail "lightdm-autologin-greeter not installed"
+    [[ -f "$KALI_ROOT/usr/lib/systemd/system/lightdm.service" ]] \
+        || vfail "lightdm not installed"
+    [[ -L "$KALI_ROOT/etc/systemd/system/multi-user.target.wants/zramswap.service" ]] \
+        || vfail "zramswap.service not enabled"
+    [[ -f "$KALI_ROOT/etc/systemd/system/getty@tty1.service.d/autologin.conf" ]] \
+        || vfail "getty@tty1 autologin drop-in missing"
+    [[ -f "$KALI_ROOT/etc/systemd/system/dbus.service.d/workdir.conf" ]] \
+        || vfail "dbus.service WorkingDirectory drop-in missing (would cascade-fail dbus/polkit/NM)"
+    [[ -f "$KALI_ROOT/etc/default/zramswap" ]] \
+        || vfail "/etc/default/zramswap config missing"
+    [[ -f "$KALI_ROOT/etc/lightdm/lightdm.conf.d/lightdm-autologin-greeter.conf" ]] \
+        || vfail "lightdm autologin conf missing"
+    grep -q '^wallpaper=/usr/share/backgrounds/kali/' "$KALI_ROOT/etc/xdg/pcmanfm/LXDE/pcmanfm.conf" 2>/dev/null \
+        || vfail "pcmanfm.conf wallpaper not pointing at Kali bg (would show solid black on startup)"
+    grep -q '^PERCENT=75' "$KALI_ROOT/etc/default/zramswap" 2>/dev/null \
+        || vfail "zramswap PERCENT not bumped to 75 (LXDE menu open will OOM-thrash)"
+    [[ -L "$KALI_ROOT/etc/systemd/system/bluetooth.service" \
+       && "$(readlink "$KALI_ROOT/etc/systemd/system/bluetooth.service")" == "/dev/null" ]] \
+        || vfail "bluetooth.service not masked (~10 MB resident on a 415 MB device)"
+    grep -q '^Hidden=true' "$KALI_ROOT/etc/xdg/autostart/blueman.desktop" 2>/dev/null \
+        || vfail "blueman.desktop autostart not disabled (memory diet not applied)"
+    [[ -f "$KALI_ROOT/etc/environment.d/glycin-nosandbox.conf" ]] \
+        || vfail "GLYCIN_SANDBOX_MECHANISM env override missing"
+    [[ -f "$KALI_ROOT/etc/X11/xorg.conf.d/40-cardputerzero-no-grab.conf" ]] \
+        || vfail "Xorg ignore-keypad config missing (integrated kbd would get stolen from APPLaunch)"
+    [[ -f "$KALI_ROOT/etc/X11/xorg.conf.d/98-vc4-no-glamor.conf" ]] \
+        || vfail "Xorg no-glamor config missing (Xorg will fail to allocate V3D tile-binning buffers on this RAM)"
+    [[ -x "$KALI_ROOT/home/pi/zeroclaw" ]] \
+        || vfail "/home/pi/zeroclaw missing (Claw applet will instantly exit)"
+
+    # Apt holds for the load-bearing kernel/bootloader/firmware packages —
+    # without these a casual `apt upgrade` will replace kernel8.img, the dtb,
+    # or the firmware blobs and the LCD/keypad will silently die on next boot.
+    for pkg in raspi-firmware firmware-misc-nonfree firmware-linux \
+               firmware-linux-nonfree kali-linux-firmware \
+               linux-image-rpi-v8 linux-image-rpi-2712; do
+        awk -v pkg="$pkg" '
+            BEGIN{found=0; held=0}
+            /^Package: /{p=($2==pkg)}
+            p && /^Status: hold ok installed$/{held=1}
+            p && /^Package: /{found=1}
+            END{exit !(held)}
+        ' "$KALI_ROOT/var/lib/dpkg/status" \
+            || vfail "package $pkg not apt-held (apt upgrade will brick the kernel/firmware)"
+    done
+    grep -qw 'fbcon=map:99' "$KALI_BOOT/cmdline.txt" \
+        || vfail "cmdline.txt missing 'fbcon=map:99' (kernel will paint console over APPLaunch's LCD when HDMI is unplugged)"
+    grep -qw 'quiet' "$KALI_BOOT/cmdline.txt" \
+        || vfail "cmdline.txt missing 'quiet' (kernel log will spam fbcon)"
+
+    # Tweaks landed
+    grep -q '^managed=true' "$KALI_ROOT/etc/NetworkManager/NetworkManager.conf" 2>/dev/null \
+        || vfail "NM ifupdown integration not set to managed=true (eth0 won't auto-up)"
+    [[ "$(readlink "$KALI_ROOT/etc/systemd/system/networking.service" 2>/dev/null)" == "/dev/null" ]] \
+        || vfail "networking.service not masked (will time out at boot)"
+    grep -qE "^127\.0\.1\.1[[:space:]]+$CZ_HOSTNAME\b" "$KALI_ROOT/etc/hosts" \
+        || vfail "/etc/hosts missing entry for $CZ_HOSTNAME (sudo will warn)"
+
+    # / mode 700 destroys the whole system: every non-root setuid fails to
+    # traverse / → ld.so can't open libselinux.so.1 → bash/dbus/polkit/sshd
+    # session/agetty autologin all fail with "permission denied" cascades.
+    # Must be 755. Other critical dirs must also be world-traversable.
+    local d mode
+    for d in / /usr /usr/bin /usr/sbin /usr/lib /lib /etc /var /var/lib /run /home; do
+        # -L follows symlinks so we check the target's mode (e.g. /lib → /usr/lib
+        # on usrmerged systems). The symlink's own mode is always 777 and
+        # irrelevant for traversal.
+        mode=$(stat -L -c '%a' "$KALI_ROOT$d" 2>/dev/null) || continue
+        [[ "$mode" == "755" || "$mode" == "555" ]] \
+            || vfail "$d has mode $mode (must be 755 or 555 — non-root services will fail)"
+    done
+    # /tmp is the exception — must be 1777 (sticky world-writable), not 755.
+    # apt-get in our chroot mkstemp's here and silently fails otherwise.
+    mode=$(stat -L -c '%a' "$KALI_ROOT/tmp" 2>/dev/null)
+    [[ "$mode" == "1777" ]] || vfail "/tmp has mode $mode (must be 1777 — apt + many .debs mkstemp here)"
+
+    if (( VERIFY_ERRS == 0 )); then
+        ok "All checks passed"
+        return 0
+    else
+        err "$VERIFY_ERRS check(s) failed"
+    fi
+}
+
+stage_shell() {
+    log "Dropping into interactive shell. Type 'exit' to unmount & clean up."
+    dim "cz_boot=$CZ_BOOT  cz_root=$CZ_ROOT  kali_boot=$KALI_BOOT  kali_root=$KALI_ROOT"
+    PS1='\[\033[1;35m\][graft]\[\033[0m\] \w \$ ' bash --norc -i
+}
+
+stage_fresh() {
+    log "Removing $OUT_IMG (will be re-decompressed on next run)"
+    rm -f "$OUT_IMG"
+    ok "Fresh start ready"
+}
+
+# ── stage_deploy_ssh: drop a pubkey into a flashed SD card ─────────────────
+#
+# Usage: sudo ./graft.sh deploy-ssh /dev/sdX [pubkey-file]
+#
+# Mounts /dev/sdX's rootfs partition (always p2 for our layout), writes the
+# pubkey into /home/kali/.ssh/authorized_keys, unmounts. No personal creds
+# touch the .img file itself — image stays generic.
+stage_deploy_ssh() {
+    local target_dev="${DEPLOY_SSH_DEV:-}"
+    local pubkey_file="${DEPLOY_SSH_PUBKEY:-}"
+
+    [[ -n "$target_dev" ]] \
+        || err "deploy-ssh needs a target device. Usage: DEPLOY_SSH_DEV=/dev/sdX sudo ./graft.sh deploy-ssh"
+    [[ -b "$target_dev" ]] \
+        || err "Not a block device: $target_dev"
+
+    # Pubkey resolution: env var > arg > host's id_ed25519.pub
+    if [[ -z "$pubkey_file" ]]; then
+        for cand in "$HOME/.ssh/id_ed25519.pub" /home/axon/.ssh/id_ed25519.pub; do
+            [[ -f "$cand" ]] && { pubkey_file=$cand; break; }
+        done
+    fi
+    [[ -f "$pubkey_file" ]] \
+        || err "No pubkey found. Set DEPLOY_SSH_PUBKEY=/path/to/key.pub"
+
+    log "Deploying $(basename "$pubkey_file") to kali user on $target_dev"
+
+    local mnt
+    mnt=$(mktemp -d -p /mnt deploy-ssh.XXXXXX)
+    mount "${target_dev}2" "$mnt"
+    deploy_cleanup() { umount -l "$mnt" 2>/dev/null || true; rmdir "$mnt" 2>/dev/null || true; }
+    trap deploy_cleanup RETURN
+
+    getent passwd kali >/dev/null 2>&1 || true   # host check is irrelevant; check inside rootfs
+    grep -q '^kali:' "$mnt/etc/passwd" \
+        || err "No kali user in target rootfs — re-run packages stage first"
+
+    install -d -m700 "$mnt/home/kali/.ssh"
+    cp "$pubkey_file" "$mnt/home/kali/.ssh/authorized_keys"
+    chmod 600 "$mnt/home/kali/.ssh/authorized_keys"
+    # Use the target's kali UID/GID (1000:1000 — pre-baked by stage_packages)
+    chown 1000:1000 "$mnt/home/kali/.ssh/authorized_keys"
+    chown 1000:1000 "$mnt/home/kali/.ssh"
+
+    sync
+    ok "Pubkey deployed to $target_dev (kali user)"
+    dim "Card safe to pull and boot — ssh kali@<ip> will work key-only."
+}
+
+stage_summary() {
+    sync
+    log "Summary"
+    dim "Image:    $OUT_IMG ($(du -h "$OUT_IMG" | cut -f1))"
+    dim "PARTUUID: $(blkid -s PARTUUID -o value "${KALI_LOOP}p2" 2>/dev/null || echo "?")"
+    echo
+    echo "To flash:"
+    echo "  lsblk"
+    echo "  sudo dd if='$OUT_IMG' of=/dev/sdX bs=4M status=progress conv=fsync"
+    echo
+    echo "After boot, expected serial console at 115200 baud."
+    echo "SSH should come up automatically with kali:kali."
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+show_help() {
+    cat <<'HELP'
+graft.sh — assemble a Kali arm64 image that runs APPLaunch on the M5 Cardputer Zero LCD.
+
+Stages (run any subset; default is "all"):
+  check     | verify host tooling + input images exist
+  donor     | fetch + decompress the OEM CZ donor (skip if CZ_IMG present)
+  unxz      | decompress Kali base .xz (skip if .img exists)
+  resize    | grow Kali rootfs by $GROW_GB (skip if already grown)
+  mount     | loop-attach + mount both images (CZ ro, Kali rw)
+  boot      | transplant kernel/dtb/overlays + write merged config.txt/cmdline.txt/user-data
+  rootfs    | copy CZ kernel modules + CM0 BCM firmware blobs + Cypress NVRAM (incl. BCM43439 boardflags3 fix)
+  applaunch      | install APPLaunch .deb (prefers local build, else donor's bundled one)
+  launcher-build | (opt-in, NOT in 'all') build APPLaunch from upstream source + cache .deb. LAUNCHER_REBUILD=1 to force.
+  configs        | write static configs (glycin env, fbcon disable, X input ignore, lightdm autologin, skel)
+  packages       | chroot via qemu-user-static and apt-install LXDE + lightdm-autologin-greeter + zram-tools + feh
+  tweaks    | NM managed=true, mask networking.service, /etc/hosts entry
+  verify    | sanity-check the result
+  shell     | mount everything and drop into an interactive bash for tinkering
+  deploy-ssh| (post-flash) drop a pubkey into kali user on a flashed SD card. DEPLOY_SSH_DEV=/dev/sdX [DEPLOY_SSH_PUBKEY=path]
+  fresh     | delete the current .img so the next run starts from .xz
+
+Examples:
+  sudo ./graft.sh                            # run everything
+  sudo ./graft.sh boot verify                # re-do just the boot partition + verify
+  sudo ./graft.sh shell                      # mount + interactive subshell
+  sudo CZ_HOSTNAME=cz-test ./graft.sh boot   # custom hostname
+  sudo APPLAUNCH_DEB=/path/to/new.deb ./graft.sh applaunch  # swap APPLaunch build
+
+Environment overrides (defaults resolve against \$SCRIPT_DIR):
+  CZ_IMG          path to decompressed donor .img (default: \$SCRIPT_DIR/cardputerzero-trixie-arm64-latest.img)
+  CZ_XZ           path to donor .img.xz (default: \$SCRIPT_DIR/cardputerzero-trixie-arm64-latest.img.xz)
+  CZ_URL          URL to fetch CZ_XZ from if absent (default: M5Stack OSS bucket)
+  KALI_XZ         path to kali-…-arm64.img.xz source (default: \$SCRIPT_DIR/kali-linux-2026.1-raspberry-pi-arm64.img.xz)
+  OUT_IMG         path to the produced .img (defaults to KALI_XZ minus .xz)
+  APPLAUNCH_DEB   path to applaunch_*.deb (defaults: most recent \$SCRIPT_DIR/applaunch_*.deb, else donor's bundled)
+  LAUNCHER_SRC    path to M5CardputerZero-Launcher (auto-detected if alongside or one level up)
+  CZ_HOSTNAME     hostname to set in cloud-init user-data (default: cardputerzero-kali)
+  GROW_GB         extra GiB to add to rootfs (default: 4)
+HELP
+}
+
+# Help/version need no privileges — handle before sudo re-exec
+case "${1:-}" in
+    -h|--help|help) show_help; exit 0 ;;
+esac
+
+require_root "$@"
+
+# Run sequence ─ default is "all"; user may pass any sequence of stages
+STAGES=("$@")
+[[ ${#STAGES[@]} -gt 0 ]] || STAGES=(all)
+
+run_stage() {
+    case "$1" in
+        check)     stage_check ;;
+        donor)     stage_check; stage_donor ;;
+        unxz)      stage_check; stage_unxz ;;
+        resize)    stage_check; stage_unxz; stage_resize ;;
+        mount)     stage_check; stage_donor; stage_unxz; stage_resize; stage_mount ;;
+        boot)      stage_check; stage_donor; stage_unxz; stage_resize; stage_mount; stage_boot ;;
+        rootfs)    stage_check; stage_donor; stage_unxz; stage_resize; stage_mount; stage_rootfs ;;
+        applaunch) stage_check; stage_donor; stage_unxz; stage_resize; stage_mount; stage_applaunch ;;
+        launcher-build) stage_check; stage_launcher_build ;;
+        configs)   stage_check; stage_donor; stage_unxz; stage_resize; stage_mount; stage_configs ;;
+        packages)  stage_check; stage_donor; stage_unxz; stage_resize; stage_mount; stage_packages ;;
+        tweaks)    stage_check; stage_donor; stage_unxz; stage_resize; stage_mount; stage_tweaks ;;
+        verify)    stage_check; stage_donor; stage_unxz; stage_resize; stage_mount; stage_verify ;;
+        shell)     stage_check; stage_donor; stage_unxz; stage_resize; stage_mount; stage_shell ;;
+        deploy-ssh) stage_deploy_ssh ;;
+        fresh)     cleanup; stage_fresh ;;
+        all)
+            stage_check
+            stage_donor
+            stage_unxz
+            stage_resize
+            stage_mount
+            stage_boot
+            stage_rootfs
+            stage_applaunch
+            stage_configs
+            stage_packages
+            stage_tweaks
+            stage_verify
+            stage_summary
+            ;;
+        *) err "Unknown stage: $1 (try: $0 --help)" ;;
+    esac
+}
+
+for s in "${STAGES[@]}"; do run_stage "$s"; done
