@@ -157,9 +157,9 @@ sudo DEPLOY_SSH_DEV=/dev/sdX DEPLOY_SSH_PUBKEY=/path/to/key.pub \
 
 | Var | Default | Effect |
 |---|---|---|
-| `CZ_IMG` | `$SCRIPT_DIR/cardputerzero-trixie-arm64-latest.img` | Decompressed donor .img. Set to a different path (e.g. a `dd` of your tinkered SD card) to graft from that instead. |
+| `CZ_IMG` | `$SCRIPT_DIR/cardputerzero-trixie-arm64-latest.img` | Decompressed donor .img. **For the camera userspace lift to work, point this at M5Stack's `20250513_os.img` (or newer)** — the older `cardputerzero-trixie-arm64-latest` donor lacks `libcamera-ipa`. |
 | `CZ_XZ` | `$SCRIPT_DIR/cardputerzero-trixie-arm64-latest.img.xz` | Donor .img.xz. If neither `CZ_IMG` nor `CZ_XZ` exists, `stage_donor` downloads from `CZ_URL`. |
-| `CZ_URL` | M5Stack OSS bucket URL for the OEM image | Source for the fetch step. |
+| `CZ_URL` | M5Stack OSS bucket URL for the OEM image | Source for the fetch step. The default points at the older `-latest` build; for the camera-capable donor, fetch `https://m5stack.oss-cn-shenzhen.aliyuncs.com/resource/linux/cp0/20250513_os.img.zip` manually and `unzip` it. |
 | `KALI_XZ` | `$SCRIPT_DIR/kali-linux-2026.1-raspberry-pi-arm64.img.xz` | Base rootfs .xz |
 | `OUT_IMG` | `${KALI_XZ%.xz}` | Output .img path |
 | `APPLAUNCH_DEB` | (auto: prefers most recent `$SCRIPT_DIR/applaunch_*.deb`, falls back to donor's) | Specific .deb to install |
@@ -222,7 +222,7 @@ sudo DEPLOY_SSH_DEV=/dev/sdX DEPLOY_SSH_PUBKEY=/path/to/key.pub \
 
 Issues with M5Stack's stock OEM image we inherit and can't currently work around:
 
-- **Camera applet shows black / no frames.** `imx219` driver loads on CSI but I2C reads to the sensor at `0x10` return `-EREMOTEIO` (sensor doesn't ACK). Same failure on the stock Debian Trixie OEM image. Reported as fixed by at least one beta tester (sn0ren) but the recipe hasn't been published. `camera_auto_detect=1` doesn't help — it leaves the CSI mux uninstantiated and no sensor binds at all. Likely needs a different overlay (sensor not actually IMX219?) or a power-on GPIO sequence the current DT doesn't drive
+- ~~Camera applet shows black / no frames.~~ **FIXED in this image** (as of 2026-05-27): M5Stack's May 2025 OEM image added a `camera-gpio16-high-overlay` that drives GPIO16 high at DT-init time to power the IMX219 sensor's regulator, and our `stage_rootfs` now lifts M5's `libcamera-ipa` + Pi-patched `libcamera 0.7.0` + TFLite/absl/farmhash/cpuinfo deps from the donor (Kali rolling doesn't package the IPA). **Requires the 2025-05-13 (or newer) donor image** — `CZ_IMG=/path/to/20250513_os.img`. With the older `cardputerzero-trixie-arm64-latest` donor, verify fails because the donor lacks `libcamera-ipa` entirely
 - **`pigpio` not packaged in Kali rolling.** The launcher's GPIO app shells out to `pigs prs/pfs/p ...` (pigpio's shell client) which requires the `pigpio` package + a running `pigpiod`. Kali drops it on security grounds (pigpio mmap's `/dev/mem`). The GPIO app's PWM tab silently no-ops. Workaround paths: (a) build pigpio from source in `stage_packages`, (b) port the launcher's GPIO app to libgpiod (we install `gpiod` so `gpioset/gpioget/gpioinfo` are available for digital I/O). Neither attempted yet.
 - **Several launcher apps shell out to `/home/pi/...` binaries that don't exist in either our image or M5Stack's OEM** — we don't have authoritative public sources for them so they aren't vendored:
   - `/home/pi/roller485` — MIDI app's roller-motor controller

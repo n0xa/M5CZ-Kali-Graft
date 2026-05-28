@@ -246,16 +246,18 @@ stage_boot() {
     # cardputerzero-overlay.dtbo ships with the OEM donor.
     cp -a "$CZ_BOOT/overlays/cardputerzero-overlay.dtbo" "$KALI_BOOT/overlays/"
 
-    # lsm6ds3tr overlay is NOT in the OEM image (M5 ships it as DTS source
-    # you build on-device). We carry a pre-built .dtbo in vendored/. The
-    # in-tree st_lsm6dsx driver binds it. (`install` instead of `cp -a` —
-    # exfat→FAT32 ownership preservation silently fails with cp -a.)
+    # Overlays we want present: lsm6ds3tr (IMU, bound by mainline st_lsm6dsx)
+    # plus two GPIO-high overlays that M5Stack added in their 2025-05-13 image
+    # to power on the camera (GPIO16) and speaker amp (GPIO24) at DT-init time.
+    # The camera-gpio16 overlay is the suspected fix for the IMX219 sensor not
+    # ACKing i2c reads — sensor was unpowered without it. (`install` instead of
+    # `cp -a` — exfat→FAT32 ownership preservation silently fails with cp -a.)
     #
     # No bq27220 overlay: the chip has no in-tree Linux driver, and the
-    # out-of-tree binary we used to vendor came from an undocumented build
-    # (GPL source unavailable). APPLaunch talks to the chip directly via
-    # /dev/i2c-1 — see stage_configs for the i2c-dev autoload.
-    for ov in lsm6ds3tr-overlay.dtbo; do
+    # out-of-tree binary M5 ships against it isn't useful (data flash is
+    # uncalibrated, on-chip SOC is wrong regardless). APPLaunch talks to the
+    # chip directly via /dev/i2c-1 — see stage_configs for the i2c-dev autoload.
+    for ov in lsm6ds3tr-overlay.dtbo camera-gpio16-high-overlay.dtbo spk-gpio24-high-overlay.dtbo; do
         if [[ -f "$CZ_BOOT/overlays/$ov" ]]; then
             install -m644 "$CZ_BOOT/overlays/$ov" "$KALI_BOOT/overlays/$ov"
         else
@@ -306,6 +308,13 @@ enable_uart=1
 # Cardputer Zero carrier-board overlays
 dtoverlay=cardputerzero-overlay
 dtoverlay=lsm6ds3tr-overlay
+
+# Power-enable the IMX219 camera sensor (GPIO16 HIGH) and the speaker amp
+# (GPIO24 HIGH) at DT-init time. M5 added these to their May 2025 image; the
+# camera one is the suspected fix for the sensor not ACKing i2c probes on
+# earlier builds (which we and other beta testers reported as a "dead camera").
+dtoverlay=camera-gpio16-high-overlay
+dtoverlay=spk-gpio24-high-overlay
 
 # IR receiver + transmitter (per CZ stock config)
 dtoverlay=gpio-ir,gpio_pin=13,gpio_pull=up
@@ -371,6 +380,17 @@ stage_rootfs() {
         cp -a "$mod_src" "$KALI_ROOT/usr/lib/modules/"
         ok "Copied $(du -sh "$mod_dst" | cut -f1) of modules"
         rebuild_depmod=1
+
+        # M5's 2025-05+ image ships bq27xxx_battery*.ko in BOTH /extra/ (their
+        # out-of-tree builds, incl. _hdq variant) AND /kernel/drivers/power/supply/
+        # (in-tree variants enabled via CONFIG_BATTERY_BQ27XXX=y). We don't want
+        # any of them: the chip's data flash is uncalibrated, the kernel driver
+        # binds it as bq27500 (wrong register map), and APPLaunch already reads
+        # it correctly via /dev/i2c-1 with a voltage-derived SOC. Strip both
+        # locations before depmod so they aren't loaded at boot. See README's
+        # "no kernel driver for bq27220" entry for context.
+        rm -f "$mod_dst/extra/bq27xxx_battery"*.ko \
+              "$mod_dst/kernel/drivers/power/supply/bq27xxx_battery"*.ko
     fi
 
     if (( rebuild_depmod )); then
@@ -416,6 +436,75 @@ stage_rootfs() {
     local clm="$KALI_ROOT/usr/lib/firmware/brcm/brcmfmac43430-sdio.raspberrypi,0-compute-module.clm_blob"
     if [[ ! -e "$clm" ]]; then
         ln -sf ../cypress/cyfmac43430-sdio.clm_blob "$clm"
+    fi
+
+    # Camera userspace lift — gated on donor shipping libcamera-ipa. Kali rolling
+    # doesn't package libcamera-ipa at all, and the Pi-patched IPA links against
+    # symbols (libcamera::controls::rpi::CnnEnableInputTensor, etc.) that
+    # upstream Debian's libcamera 0.7.1 doesn't expose. The fix is to lift the
+    # whole camera userspace stack ABI-consistently from M5's donor (their
+    # libcamera 0.7.0 has the Pi patches that the IPA needs). Without this the
+    # IMX219 sensor is reachable but no app can register the camera — applet
+    # shows a black viewfinder. Requires donor = M5's 2025-05+ image (the older
+    # cardputerzero-trixie-arm64-latest doesn't include the IPA stack).
+    local ipa_marker="$CZ_ROOT/usr/lib/aarch64-linux-gnu/libcamera/ipa/ipa_rpi_vc4.so"
+    if [[ -f "$ipa_marker" ]]; then
+        log "Donor ships libcamera-ipa — lifting camera userspace stack"
+
+        # Move Kali's libcamera 0.7.1 binaries OUT of /usr/lib so ldconfig
+        # doesn't pick the higher numeric version after we drop M5's 0.7.0 in.
+        # (We keep them under /root/kali-libcamera-backup/ for easy revert.)
+        install -d -m755 "$KALI_ROOT/root/kali-libcamera-backup"
+        for f in libcamera.so.0.7.1 libcamera-base.so.0.7.1; do
+            if [[ -f "$KALI_ROOT/usr/lib/aarch64-linux-gnu/$f" ]]; then
+                mv "$KALI_ROOT/usr/lib/aarch64-linux-gnu/$f" \
+                   "$KALI_ROOT/root/kali-libcamera-backup/$f"
+            fi
+        done
+        # Drop the soname symlinks too — ldconfig will recreate them pointing
+        # at M5's 0.7.0 once it scans the lib dir.
+        rm -f "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera.so.0.7" \
+              "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera-base.so.0.7"
+
+        # Copy M5's libcamera + base (preserves symlinks via cp -a)
+        for f in libcamera.so libcamera.so.0.7 libcamera.so.0.7.0 \
+                 libcamera-base.so libcamera-base.so.0.7 libcamera-base.so.0.7.0; do
+            [[ -e "$CZ_ROOT/usr/lib/aarch64-linux-gnu/$f" ]] && \
+                cp -af "$CZ_ROOT/usr/lib/aarch64-linux-gnu/$f" \
+                       "$KALI_ROOT/usr/lib/aarch64-linux-gnu/"
+        done
+
+        # Camera-stack runtime deps not packaged in Kali: TFLite (used by IPA
+        # for autofocus / scene detection), absl, farmhash, cpuinfo.
+        for pat in 'libtensorflow-lite.so*' 'libfarmhash.so*' 'libcpuinfo.so*' 'libabsl_*.so.20240722'; do
+            for src in "$CZ_ROOT"/usr/lib/aarch64-linux-gnu/$pat; do
+                [[ -e "$src" ]] && cp -af "$src" "$KALI_ROOT/usr/lib/aarch64-linux-gnu/"
+            done
+        done
+
+        # IPA plugins (.so + .so.sign) and per-sensor tuning JSONs
+        install -d -m755 "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera"
+        cp -af "$CZ_ROOT/usr/lib/aarch64-linux-gnu/libcamera/ipa" \
+               "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera/"
+        install -d -m755 "$KALI_ROOT/usr/share/libcamera"
+        cp -af "$CZ_ROOT/usr/share/libcamera/ipa" \
+               "$KALI_ROOT/usr/share/libcamera/"
+
+        # IPC proxy workers (libcamera runs the IPA in a separate process for
+        # isolation; this is the helper binary that hosts the IPA module).
+        install -d -m755 "$KALI_ROOT/usr/libexec/aarch64-linux-gnu/libcamera"
+        for f in raspberrypi_ipa_proxy vimc_ipa_proxy v4l2-compat.so; do
+            [[ -f "$CZ_ROOT/usr/libexec/aarch64-linux-gnu/libcamera/$f" ]] && \
+                install -m755 "$CZ_ROOT/usr/libexec/aarch64-linux-gnu/libcamera/$f" \
+                              "$KALI_ROOT/usr/libexec/aarch64-linux-gnu/libcamera/"
+        done
+
+        # ldconfig runs later inside the chroot (stage_packages); rebuilding
+        # /etc/ld.so.cache here against the live system would be wrong anyway.
+        ok "Camera userspace lifted from donor"
+    else
+        warn "Donor lacks libcamera-ipa — camera applet will show black viewfinder."
+        warn "Use M5's 2025-05+ image as donor (CZ_IMG=/path/to/20250513_os.img)."
     fi
 
     # Hostname (cloud-init handles it too, but be belt-and-braces)
@@ -786,6 +875,10 @@ systemctl enable zramswap
 #
 # To intentionally upgrade one of these (e.g. M5Stack publishes a refreshed
 # kernel), `sudo apt-mark unhold <pkg>; sudo apt install <pkg>` then re-hold.
+# libcamera0.7 is also held: stage_rootfs lifted M5's Pi-patched 0.7.0 over
+# Kali's upstream 0.7.1 because the IPA links against Pi-specific symbols.
+# An `apt upgrade` of libcamera0.7 would overwrite our patched binary with
+# the upstream one and the camera applet would go black again.
 apt-mark hold \
     raspi-firmware \
     firmware-misc-nonfree \
@@ -793,7 +886,24 @@ apt-mark hold \
     firmware-linux-nonfree \
     kali-linux-firmware \
     linux-image-rpi-v8 \
-    linux-image-rpi-2712
+    linux-image-rpi-2712 \
+    libcamera0.7
+
+# Re-assert the libcamera 0.7.0 lift. stage_rootfs did this once, but apt
+# (just above) installed Kali's libcamera0.7 package which dropped 0.7.1
+# back in and re-pointed the soname. apt-mark hold only blocks future
+# upgrades, not the initial install in the same apt run. So we now move
+# Kali's freshly-installed 0.7.1 back out and let ldconfig point the
+# soname at the only remaining file — M5's Pi-patched 0.7.0.
+mkdir -p /root/kali-libcamera-backup
+for f in libcamera.so.0.7.1 libcamera-base.so.0.7.1; do
+    if [ -f /usr/lib/aarch64-linux-gnu/$f ]; then
+        mv /usr/lib/aarch64-linux-gnu/$f /root/kali-libcamera-backup/
+    fi
+done
+rm -f /usr/lib/aarch64-linux-gnu/libcamera.so.0.7 \
+      /usr/lib/aarch64-linux-gnu/libcamera-base.so.0.7
+ldconfig
 
 # ── Memory diet: disable autostart bloat (~110 MB savings on the 415 MB CM0)
 # Each unwanted .desktop gets a "Hidden=true" line appended, which suppresses
@@ -1182,7 +1292,9 @@ stage_verify() {
     # matching the OEM image.)
     for f in kernel8.img bcm2710-rpi-cm0.dtb \
              overlays/cardputerzero-overlay.dtbo \
-             overlays/lsm6ds3tr-overlay.dtbo; do
+             overlays/lsm6ds3tr-overlay.dtbo \
+             overlays/camera-gpio16-high-overlay.dtbo \
+             overlays/spk-gpio24-high-overlay.dtbo; do
         [[ -f "$KALI_BOOT/$f" ]] || vfail "missing boot file: $f"
     done
 
@@ -1218,6 +1330,24 @@ stage_verify() {
     [[ -L "$KALI_ROOT/etc/systemd/system/default.target" \
        && "$(readlink "$KALI_ROOT/etc/systemd/system/default.target")" =~ graphical\.target$ ]] \
         || vfail "default.target is not graphical.target (lightdm won't auto-start)"
+
+    # Camera userspace (lifted from M5 donor in stage_rootfs). All three are
+    # required to render frames; any one missing and the applet shows black.
+    [[ -f "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera/ipa/ipa_rpi_vc4.so" ]] \
+        || vfail "ipa_rpi_vc4.so missing (camera applet will be black)"
+    [[ -f "$KALI_ROOT/usr/libexec/aarch64-linux-gnu/libcamera/raspberrypi_ipa_proxy" ]] \
+        || vfail "raspberrypi_ipa_proxy missing (IPA can't be hosted)"
+    [[ -f "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera.so.0.7.0" ]] \
+        || vfail "libcamera 0.7.0 (Pi-patched) missing — IPA needs CnnEnableInputTensor symbol"
+    # The soname must resolve to M5's 0.7.0, not Kali's 0.7.1 — if Kali's
+    # leaked back into /usr/lib, ldconfig will alphabetically/numerically pick
+    # it and the IPA load fails with an undefined-symbol error.
+    if [[ -L "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera.so.0.7" ]]; then
+        [[ "$(readlink "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera.so.0.7")" == "libcamera.so.0.7.0" ]] \
+            || vfail "libcamera.so.0.7 soname does not point at 0.7.0 (camera will use Kali ABI and fail)"
+    fi
+    [[ ! -f "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera.so.0.7.1" ]] \
+        || vfail "Stale libcamera.so.0.7.1 still in /usr/lib — ldconfig will pick it over 0.7.0"
 
     # M5 modules
     for mod in pwm_bl_m5stack es8389_m5stack st7789v_m5stack tca8418_keypad_m5stack py32ioexp; do
