@@ -40,10 +40,18 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # Donor: M5Stack's OEM CardputerZero OS image (Debian Trixie arm64).
-# Anyone can reproduce from a known-good baseline by letting graft.sh fetch
-# the .img.xz from M5Stack's OSS bucket. To use a hand-modified donor (e.g.
-# a dd of a tinkered-on CZ SD card), override CZ_IMG.
-CZ_URL="${CZ_URL:-https://cardputer-zero-repo.oss-cn-shenzhen.aliyuncs.com/cardputerzero-trixie-arm64-latest.img.xz}"
+# M5's "…-latest.img.xz" is a MOVING pointer — building against it blind is how
+# we shipped a kernel/modules-skewed image (a silent kernel bump). So we PIN to
+# a specific OSS object version (versionId), which is reproducible and notes
+# exactly which upstream image we recalibrated against. `graft.sh drift` compares
+# the pin to current latest and flags when M5 publishes a new one.
+# To use a hand-modified donor (e.g. a dd of a tinkered-on CZ SD card), set CZ_IMG.
+CZ_BASE_URL="${CZ_BASE_URL:-https://cardputer-zero-repo.oss-cn-shenzhen.aliyuncs.com/cardputerzero-trixie-arm64-latest.img.xz}"
+# Pinned donor version. Bump deliberately when recalibrating to a newer image
+# (get the new id from: curl -sI <CZ_BASE_URL> | grep -i x-oss-version-id).
+#   pinned: 2026-06-01 publish — kernel 6.18.29+rpt-rpi-v8
+CZ_VERSION_ID="${CZ_VERSION_ID:-CAEQgwEYgYCAzK_AhPQZIiBmOTBjYWI5NjZkNDM0Mjk0YTQ5MzU5ZWIzZGU1MjgwZQ--}"
+CZ_URL="${CZ_URL:-${CZ_BASE_URL}?versionId=${CZ_VERSION_ID}}"
 CZ_XZ="${CZ_XZ:-$SCRIPT_DIR/cardputerzero-trixie-arm64-latest.img.xz}"
 CZ_IMG="${CZ_IMG:-${CZ_XZ%.xz}}"
 
@@ -147,6 +155,26 @@ trap cleanup EXIT
 
 # ─── Stages ──────────────────────────────────────────────────────────────────
 
+# check_donor_drift: compare our pinned donor version against M5's current
+# "latest" by ETag (HEAD both). Informational — it never fails the build (we
+# build against the pin on purpose); it just flags when upstream has moved so we
+# know to recalibrate (bump CZ_VERSION_ID, rebuild, reflash).
+check_donor_drift() {
+    command -v curl >/dev/null 2>&1 || { warn "curl missing — skipping donor drift check"; return 0; }
+    local pin lat
+    pin=$(curl -fsSI --max-time 30 "${CZ_BASE_URL}?versionId=${CZ_VERSION_ID}" 2>/dev/null | tr -d '\r' | awk -F': ' 'tolower($1)=="etag"{print $2}')
+    lat=$(curl -fsSI --max-time 30 "${CZ_BASE_URL}"                            2>/dev/null | tr -d '\r' | awk -F': ' 'tolower($1)=="etag"{print $2}')
+    if [[ -z "$lat" || -z "$pin" ]]; then
+        warn "donor drift check: upstream unreachable (offline?) — skipping"
+    elif [[ "$pin" == "$lat" ]]; then
+        ok "donor pin is current — upstream 'latest' == pinned version"
+    else
+        warn "UPSTREAM DONOR MOVED: latest ETag $lat != pinned $pin"
+        warn "M5 published a new CZ image. To recalibrate: set CZ_VERSION_ID to the new id"
+        warn "(curl -sI '$CZ_BASE_URL' | grep -i x-oss-version-id), then rebuild + reflash."
+    fi
+}
+
 stage_check() {
     log "Checking dependencies"
     require_cmds xz parted partprobe e2fsck resize2fs blkid losetup ar tar zstd mountpoint truncate curl
@@ -163,6 +191,7 @@ stage_check() {
     dim "Kali xz:   $KALI_XZ"
     dim "Out img:   $OUT_IMG"
     dim "Hostname:  $CZ_HOSTNAME"
+    check_donor_drift
 }
 
 stage_donor() {
@@ -243,8 +272,48 @@ stage_boot() {
     cp -a "$CZ_BOOT/kernel8.img"         "$KALI_BOOT/"
     cp -a "$CZ_BOOT/bcm2710-rpi-cm0.dtb" "$KALI_BOOT/"
 
-    # cardputerzero-overlay.dtbo ships with the OEM donor.
-    cp -a "$CZ_BOOT/overlays/cardputerzero-overlay.dtbo" "$KALI_BOOT/overlays/"
+    # cardputerzero-overlay.dtbo: install OUR patched version (vendored), not
+    # the donor's. M5's stock overlay declares 3 SPI0 chip-selects with CS2
+    # mapped to GPIO22, but no overlay node consumes CS2 — it's dead weight
+    # left over from copy-paste. The conflict surfaces when you plug in M5's
+    # own LoRa SX1262 cap (Ultimate Edition Kickstarter accessory): the cap's
+    # BUSY signal lives on GPIO22 and the applet's `busy_gpio_init` fails
+    # with rc=1 because the SPI subsystem has already claimed the pin. Our
+    # patched .dtbo drops num-cs to 2, removes the third cs-gpios triplet,
+    # and cleans up the matching __fixups__ reference. Diff is ±4 lines, no
+    # other functional change. Keep the donor's original on disk as a `.m5orig`
+    # backup so users can revert if some other consumer of CS2 ever appears.
+    # Version-agnostic: patch the DONOR's own overlay at build time rather than
+    # shipping a static .dtbo that goes stale every donor bump (and that would
+    # also carry the old IO-expander binding — M5 renamed py32ioexp -> m5ioe1).
+    # Decompile, drop num-cs 3->2 + the dead CS2/GPIO22 triplet + its __fixups__
+    # ref, recompile. dtc round-trip is lossless (verified). The num-cs sed is a
+    # no-op if M5 ever fixes it upstream; stage_verify re-checks num-cs == 2.
+    local cz_ovl="$CZ_BOOT/overlays/cardputerzero-overlay.dtbo"
+    if command -v dtc >/dev/null 2>&1 && [[ -f "$cz_ovl" ]]; then
+        local ov_dts; ov_dts=$(mktemp)
+        dtc -I dtb -O dts -o "$ov_dts" "$cz_ovl" 2>/dev/null
+        sed -i \
+            -e 's/num-cs = <0x03>/num-cs = <0x02>/' \
+            -e 's/\(cs-gpios = <0xffffffff 0x08 0x01 0xffffffff 0x07 0x01\) 0xffffffff 0x16 0x01>/\1>/' \
+            -e 's/, "[^"]*:cs-gpios:24"//' \
+            "$ov_dts"
+        if dtc -I dts -O dtb -o "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo" "$ov_dts" 2>/dev/null \
+           && dtc -I dtb -O dts "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo" 2>/dev/null | grep -q 'num-cs = <0x02>'; then
+            ok "Patched cardputerzero-overlay (num-cs 3->2, dropped dead CS2/GPIO22)"
+        else
+            warn "build-time overlay patch failed — falling back to vendored .dtbo"
+            install -m644 "$SCRIPT_DIR/vendored/cardputerzero-overlay-cs2fix.dtbo" \
+                          "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo"
+        fi
+        rm -f "$ov_dts"
+        install -m644 "$cz_ovl" "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo.m5orig"
+    else
+        warn "dtc or donor overlay missing — using vendored .dtbo (may be stale for this donor)"
+        install -m644 "$SCRIPT_DIR/vendored/cardputerzero-overlay-cs2fix.dtbo" \
+                      "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo"
+        [[ -f "$cz_ovl" ]] && install -m644 "$cz_ovl" "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo.m5orig"
+    fi
 
     # Overlays we want present: lsm6ds3tr (IMU, bound by mainline st_lsm6dsx)
     # plus two GPIO-high overlays that M5Stack added in their 2025-05-13 image
@@ -276,8 +345,8 @@ write_config_txt() {
     cat > "$KALI_BOOT/config.txt" <<'CONFIG'
 # Cardputer Zero on Kali — merged config.txt
 # Original Kali base preserved as config.txt.kali.
-# Boots CZ's M5-patched 6.12.75 kernel directly via the GPU firmware
-# loader (no u-boot chain — the OEM image runs the same way).
+# Boots CZ's M5-patched kernel (kernel8.img, transplanted from the donor)
+# directly via the GPU firmware loader — no u-boot chain, same as the OEM image.
 
 dtparam=i2c_arm=on
 dtparam=i2s=on
@@ -370,8 +439,16 @@ stage_rootfs() {
     log "Rootfs transplant: modules + firmware"
 
     # Kernel modules. Kali is usrmerged so the canonical path is /usr/lib/modules.
-    local mod_src="$CZ_ROOT/lib/modules/6.12.75+rpt-rpi-v8"
-    local mod_dst="$KALI_ROOT/usr/lib/modules/6.12.75+rpt-rpi-v8"
+    # Version-agnostic: derive the kernel version from the DONOR's own v8 module
+    # dir (the CM0 / Pi-Zero-2-W kernel is the +rpt-rpi-v8 flavour), so the graft
+    # follows whatever kernel M5 ships instead of being nailed to one version and
+    # skewing against the transplanted kernel8.img. stage_verify re-checks the match.
+    local KVER
+    KVER=$(basename "$(ls -d "$CZ_ROOT"/lib/modules/*+rpt-rpi-v8 2>/dev/null | sort -V | tail -1)")
+    [[ -n "$KVER" ]] || err "donor has no +rpt-rpi-v8 kernel modules ($CZ_ROOT/lib/modules)"
+    log "Donor kernel modules: $KVER"
+    local mod_src="$CZ_ROOT/lib/modules/$KVER"
+    local mod_dst="$KALI_ROOT/usr/lib/modules/$KVER"
     local rebuild_depmod=0
     if [[ -d "$mod_dst" ]]; then
         ok "Modules dir already present — skipping (delete it to force re-copy)"
@@ -394,8 +471,8 @@ stage_rootfs() {
     fi
 
     if (( rebuild_depmod )); then
-        log "Rebuilding modules.dep (depmod) for 6.12.75+rpt-rpi-v8"
-        depmod -b "$KALI_ROOT" 6.12.75+rpt-rpi-v8
+        log "Rebuilding modules.dep (depmod) for $KVER"
+        depmod -b "$KALI_ROOT" "$KVER"
     fi
 
     # CM0-specific Broadcom firmware (brcm/ tree)
@@ -451,27 +528,37 @@ stage_rootfs() {
     if [[ -f "$ipa_marker" ]]; then
         log "Donor ships libcamera-ipa — lifting camera userspace stack"
 
-        # Move Kali's libcamera 0.7.1 binaries OUT of /usr/lib so ldconfig
-        # doesn't pick the higher numeric version after we drop M5's 0.7.0 in.
-        # (We keep them under /root/kali-libcamera-backup/ for easy revert.)
-        install -d -m755 "$KALI_ROOT/root/kali-libcamera-backup"
-        for f in libcamera.so.0.7.1 libcamera-base.so.0.7.1; do
-            if [[ -f "$KALI_ROOT/usr/lib/aarch64-linux-gnu/$f" ]]; then
-                mv "$KALI_ROOT/usr/lib/aarch64-linux-gnu/$f" \
-                   "$KALI_ROOT/root/kali-libcamera-backup/$f"
-            fi
-        done
-        # Drop the soname symlinks too — ldconfig will recreate them pointing
-        # at M5's 0.7.0 once it scans the lib dir.
-        rm -f "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera.so.0.7" \
-              "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera-base.so.0.7"
+        # Version-agnostic lift. M5 bumps their Pi-patched libcamera over time
+        # (0.7.0 -> 0.7.1 -> …, sometimes to the same number Kali ships but with
+        # the Pi patches Kali's lacks), so derive versions instead of hardcoding.
+        local lcdir="$KALI_ROOT/usr/lib/aarch64-linux-gnu"
+        local m5dir="$CZ_ROOT/usr/lib/aarch64-linux-gnu"
+        local m5_lcver
+        m5_lcver=$(basename "$(ls "$m5dir"/libcamera.so.[0-9]*.[0-9]*.[0-9]* 2>/dev/null | sort -V | tail -1)" 2>/dev/null | sed 's/^libcamera\.so\.//') || true
+        [[ -n "$m5_lcver" ]] || err "donor libcamera version not found in $m5dir"
+        log "Lifting M5 Pi-patched libcamera $m5_lcver over Kali's"
 
-        # Copy M5's libcamera + base (preserves symlinks via cp -a)
-        for f in libcamera.so libcamera.so.0.7 libcamera.so.0.7.0 \
-                 libcamera-base.so libcamera-base.so.0.7 libcamera-base.so.0.7.0; do
-            [[ -e "$CZ_ROOT/usr/lib/aarch64-linux-gnu/$f" ]] && \
-                cp -af "$CZ_ROOT/usr/lib/aarch64-linux-gnu/$f" \
-                       "$KALI_ROOT/usr/lib/aarch64-linux-gnu/"
+        # Move Kali's versioned libcamera + base OUT (any X.Y.Z) so ldconfig can't
+        # prefer a numerically-higher Kali build over M5's patched one; back up for revert.
+        install -d -m755 "$KALI_ROOT/root/kali-libcamera-backup"
+        for f in "$lcdir"/libcamera.so.[0-9]*.[0-9]*.[0-9]* "$lcdir"/libcamera-base.so.[0-9]*.[0-9]*.[0-9]*; do
+            [[ -f "$f" ]] && mv "$f" "$KALI_ROOT/root/kali-libcamera-backup/"
+        done
+        # Drop the dev + soname symlinks; cp -af below brings M5's, ldconfig fixes up.
+        rm -f "$lcdir"/libcamera.so "$lcdir"/libcamera.so.[0-9]* \
+              "$lcdir"/libcamera-base.so "$lcdir"/libcamera-base.so.[0-9]*
+
+        # Copy ALL of M5's libcamera + base (every symlink + the versioned .so).
+        for f in "$m5dir"/libcamera.so* "$m5dir"/libcamera-base.so*; do
+            [[ -e "$f" ]] && cp -af "$f" "$lcdir/"
+        done
+
+        # Stash M5's versioned libcamera in the rootfs so the post-apt re-assert
+        # (stage_packages) can restore it even when apt reinstalls the SAME version
+        # number — M5's 0.7.1 vs Kali's 0.7.1 collide and apt overwrites in place.
+        install -d -m755 "$KALI_ROOT/root/m5-libcamera-pinned"
+        for f in "$m5dir"/libcamera.so.[0-9]*.[0-9]*.[0-9]* "$m5dir"/libcamera-base.so.[0-9]*.[0-9]*.[0-9]*; do
+            [[ -f "$f" ]] && cp -af "$f" "$KALI_ROOT/root/m5-libcamera-pinned/"
         done
 
         # Camera-stack runtime deps not packaged in Kali: TFLite (used by IPA
@@ -692,6 +779,54 @@ EOF
 i2c-dev
 EOF
 
+    # Audio routing. Two ALSA cards register at boot — card 0 is vc4hdmi
+    # (CZ has no physical HDMI sink, opens fail with ENOSTR), card 1 is the
+    # ES8389 codec driven by es8389_m5stack.ko + the cardputerzero-overlay's
+    # I2S wiring. ALSA's stock `default` device tries to resolve via
+    # cards.pcm.front (per-codec conf files in /usr/share/alsa/cards/) which
+    # doesn't exist for the M5-custom codec — so every ALSA app fails with
+    # "Unknown PCM cards.pcm.front" unless we point `default` at hw:1,0
+    # explicitly. Layered through a softvol plugin so apps see a usable
+    # "Master" mixer control (the kernel codec module exposes no native
+    # volume controls — alsamixer would otherwise show an empty Item: line).
+    cat > "$KALI_ROOT/etc/asound.conf" <<'EOF'
+pcm.!default {
+    type plug
+    slave.pcm "softvol_out"
+}
+
+pcm.softvol_out {
+    type softvol
+    slave.pcm "hw:1,0"
+    control {
+        name "Master"
+        card 1
+    }
+    min_dB -51.0
+    max_dB 0.0
+    resolution 256
+}
+
+ctl.!default {
+    type hw
+    card 1
+}
+EOF
+
+    # gpsd config — points at /dev/ttyS0 at 115200 baud for the LoRa+GNSS
+    # cap's onboard ATGM336H. The chip ships pre-configured to 115200 NMEA
+    # (matches Pi serial console rate, no auto-baud needed). We mask
+    # serial-getty@ttyS0 in stage_packages so login doesn't fight gpsd for
+    # the port. -n = poll immediately rather than waiting for a client; -s
+    # locks the baud rate. USBAUTO disabled so hotplug rules don't try to
+    # claim some other GPS we don't have.
+    cat > "$KALI_ROOT/etc/default/gpsd" <<'EOF'
+DEVICES="/dev/ttyS0"
+GPSD_OPTIONS="-n -s 115200"
+USBAUTO="false"
+START_DAEMON="true"
+EOF
+
     # zram swap config: 75% of RAM (~311 MB on the 415 MB CM0) compressed
     # via zstd. Service is enabled in stage_packages after zram-tools lands.
     # 50% was too tight — opening LXDE menus tipped the system over the edge.
@@ -815,12 +950,16 @@ apt-get install -y --no-install-recommends \
     -o Dpkg::Options::="--force-confold" \
     -o Dpkg::Options::="--force-confdef" \
     zram-tools \
+    cloud-guest-utils \
     lxde-core \
     lightdm-autologin-greeter \
     feh \
     libcamera0.7 \
     ffmpeg \
-    gpiod
+    gpiod \
+    pipewire-alsa \
+    gpsd \
+    gpsd-clients
 
 # Pre-create the kali user with password 'kali' instead of relying on
 # cloud-init. Kali's stock Pi image is cloud-init-based — datasource setup
@@ -834,6 +973,22 @@ fi
 echo 'kali:kali' | chpasswd
 echo 'kali ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/kali-nopasswd
 chmod 440 /etc/sudoers.d/kali-nopasswd
+
+# Device-access groups for APPLaunch-launched apps. APPLaunch runs as root but
+# execs apps (.desktop entries, e.g. flint) deprivileged as `kali` via
+# setuid/initgroups — so `kali` must directly own the hardware it touches. Stock
+# RaspiOS gives its `pi` user this whole set; the Kali base under-provisions it.
+#   input   -> /dev/input/event* (TCA8418 keypad) is 0660 root:input; without
+#              this, launched GUI apps render but get NO keystrokes.
+#   i2c     -> /dev/i2c-* is 0660 root:i2c.
+#   dialout -> serial UARTs (/dev/ttyAMA*, GPS/LoRa) when not world-rw.
+#   render  -> /dev/dri/render* (GPU); harmless + forward-compatible.
+# NOTE: SPI/GPIO/render *nodes* are root:plugdev 0666 here (this image's
+# 99-com.rules), and kali is already in plugdev (above), so no spi/gpio groups
+# are needed — don't create them; nothing on this image is owned by them.
+for grp in input i2c dialout render; do
+    getent group "$grp" >/dev/null && usermod -aG "$grp" kali
+done
 
 # NOTE: SSH authorized_keys are NOT baked into the image. The image stays
 # generic/shareable (no personal credentials). Use `graft.sh deploy-ssh
@@ -889,20 +1044,18 @@ apt-mark hold \
     linux-image-rpi-2712 \
     libcamera0.7
 
-# Re-assert the libcamera 0.7.0 lift. stage_rootfs did this once, but apt
-# (just above) installed Kali's libcamera0.7 package which dropped 0.7.1
-# back in and re-pointed the soname. apt-mark hold only blocks future
-# upgrades, not the initial install in the same apt run. So we now move
-# Kali's freshly-installed 0.7.1 back out and let ldconfig point the
-# soname at the only remaining file — M5's Pi-patched 0.7.0.
+# Re-assert the M5 Pi-patched libcamera lift. apt (just above) installed Kali's
+# libcamera0.7 package, clobbering M5's binary — and when M5 and Kali share a
+# version number it overwrites M5's *in place*. apt-mark hold only blocks future
+# upgrades, not the initial install in the same run. So: move apt's versioned
+# libcamera (any X.Y.Z) out, then RESTORE M5's from the stash stage_rootfs saved,
+# and let ldconfig re-point the soname. Version-agnostic — no hardcoded numbers.
 mkdir -p /root/kali-libcamera-backup
-for f in libcamera.so.0.7.1 libcamera-base.so.0.7.1; do
-    if [ -f /usr/lib/aarch64-linux-gnu/$f ]; then
-        mv /usr/lib/aarch64-linux-gnu/$f /root/kali-libcamera-backup/
-    fi
+for f in /usr/lib/aarch64-linux-gnu/libcamera.so.[0-9]*.[0-9]*.[0-9]* /usr/lib/aarch64-linux-gnu/libcamera-base.so.[0-9]*.[0-9]*.[0-9]*; do
+    [ -f "$f" ] && mv "$f" /root/kali-libcamera-backup/ 2>/dev/null
 done
-rm -f /usr/lib/aarch64-linux-gnu/libcamera.so.0.7 \
-      /usr/lib/aarch64-linux-gnu/libcamera-base.so.0.7
+rm -f /usr/lib/aarch64-linux-gnu/libcamera.so.[0-9]* /usr/lib/aarch64-linux-gnu/libcamera-base.so.[0-9]*
+cp -af /root/m5-libcamera-pinned/. /usr/lib/aarch64-linux-gnu/ 2>/dev/null
 ldconfig
 
 # ── Memory diet: disable autostart bloat (~110 MB savings on the 415 MB CM0)
@@ -933,6 +1086,21 @@ done
 
 # Mask bluetooth daemon (saves ~10 MB; user can unmask if they actually need BT)
 systemctl mask bluetooth.service
+
+# Mask serial-getty@ttyS0 so it doesn't fight gpsd for the UART. The LoRa+GNSS
+# cap's ATGM336H lives on ttyS0; without this mask, getty grabs the port on
+# every boot and gpsd can't claim it. Kernel boot console still uses ttyS0
+# for OUTPUT (no read contention with gpsd, baud rates match at 115200), so
+# we don't lose serial-port boot debugging. Nobody buying an LCD+keypad
+# pocket-deck expects a serial login on the GPIO header anyway.
+systemctl mask serial-getty@ttyS0.service
+
+# Enable gpsd so the LoRa+GNSS cap (or any other ttyS0 NMEA source) Just Works
+# at boot. /etc/default/gpsd was already written by stage_configs pointing at
+# /dev/ttyS0 @ 115200. -n in GPSD_OPTIONS makes it poll immediately so kismet
+# / cgps / gpspipe see data without first connecting.
+systemctl enable gpsd.socket
+systemctl enable gpsd.service
 
 # Override pcmanfm-desktop's wallpaper at the system-default level
 # (/etc/xdg/pcmanfm/LXDE/pcmanfm.conf [desktop] section). The package default
@@ -1041,6 +1209,22 @@ stage_launcher_build() {
     mount -t proc proc    "$KALI_ROOT/proc"
     mount -t sysfs sysfs  "$KALI_ROOT/sys"
 
+    # Detect if the launcher source filesystem supports symlinks. If not
+    # (exfat-mounted USB drives, fat32, etc.), upstream AppStore's SConstruct
+    # fails at `ensure_sysroot_lib_layout()` which symlinks a multiarch alias
+    # into static_lib/lib/. Rsync the tree to a scratch dir on the host's
+    # main filesystem first, then bind-mount the scratch. Override the
+    # scratch path with LAUNCHER_SCRATCH if /var/tmp is undesirable.
+    if ! ln -sf /tmp/x "$src/.symlink-probe" 2>/dev/null; then
+        local scratch="${LAUNCHER_SCRATCH:-/var/tmp/launcher-build-scratch}"
+        log "Source fs at $src doesn't support symlinks (exfat?); staging to $scratch"
+        mkdir -p "$scratch"
+        rsync -aH --delete "$src/" "$scratch/" 2>&1 | tail -3
+        src="$scratch"
+        ok "Launcher tree staged to symlink-capable filesystem"
+    fi
+    rm -f "$src/.symlink-probe" 2>/dev/null
+
     # Bind source into chroot
     mkdir -p "$KALI_ROOT/src"
     mount --bind "$src" "$KALI_ROOT/src"
@@ -1126,9 +1310,20 @@ CONFIG_V9_5_LV_USE_EVDEV=y
 CONFIG_TOOLCHAIN_PREFIX="aarch64-linux-gnu-"
 CONFIG_TOOLCHAIN_SYSROOT=""
 MK
+    # Force SConstruct's ensure_sysroot_lib_layout() to take its "full lib
+    # symlink" path. If static_lib/lib exists as a real directory (because the
+    # downloaded tarball ships one), the SConstruct only symlinks lib/aarch64-
+    # linux-gnu — but the linker also needs lib/ld-linux-aarch64.so.1, which
+    # only exists under usr/lib/. Removing static_lib/lib makes SConstruct
+    # symlink the whole lib → usr/lib instead, exposing everything the linker
+    # wants. Worth filing as an upstream AppStore SConstruct PR; for now,
+    # patch around it.
+    [ -d static_lib/lib ] && [ ! -L static_lib/lib ] && rm -rf static_lib/lib
+
     # Filter scons output to keep meaningful lines (warnings/errors and
-    # high-level progress); full output is verbose under -j.
-    yes | scons -j$(nproc) 2>&1 | grep -E "(error:|warning:|undefined reference|^CC |^LD |^scons:|FAIL)" || true
+    # high-level progress); full output is verbose under -j. Tee full log
+    # to /src/appstore-build.log for post-mortem if something fails.
+    yes | scons -j$(nproc) 2>&1 | tee /src/appstore-build.log | grep -E "(error:|warning:|undefined reference|^CC |^LD |^scons:|FAIL)" || true
     [ -x dist/M5CardputerZero-AppStore ] || { echo "BUILD FAILED: no AppStore binary at dist/"; exit 1; }
     strip --strip-unneeded dist/M5CardputerZero-AppStore
     ls -la dist/M5CardputerZero-AppStore
@@ -1274,6 +1469,52 @@ stage_tweaks() {
         echo "127.0.1.1	$CZ_HOSTNAME" >> "$hosts"
     fi
 
+    # 4. First-boot rootfs grow. cloud-init is DISABLED on this image (its
+    #    datasource is unreliable here — same reason we pre-bake the kali user),
+    #    so cloud-init's growpart module never runs and the rootfs stays at the
+    #    built image size instead of filling the SD card. Ship a tiny one-shot
+    #    service that does growpart + resize2fs once on first boot, guarded by a
+    #    sentinel so it never runs again. (growpart from cloud-guest-utils,
+    #    installed in stage_packages; resize2fs + parted are in the base.)
+    install -d -m755 "$KALI_ROOT/usr/local/sbin"
+    cat > "$KALI_ROOT/usr/local/sbin/cz-firstboot-resize.sh" <<'RESIZE'
+#!/bin/sh
+# Grow the root partition + filesystem to fill the card, once, on first boot.
+set -e
+SENTINEL=/var/lib/cz-graft/.resized
+[ -e "$SENTINEL" ] && exit 0
+SRC=$(findmnt -no SOURCE /)
+DISK=$(lsblk -no PKNAME "$SRC" 2>/dev/null)
+PART=$(printf '%s' "$SRC" | grep -oE '[0-9]+$')
+if [ -n "$DISK" ] && [ -n "$PART" ]; then
+    growpart "/dev/$DISK" "$PART" || true   # extend the partition (online)
+    resize2fs "$SRC" || true                # grow the ext4 (online, mounted /)
+fi
+mkdir -p "$(dirname "$SENTINEL")"
+: > "$SENTINEL"
+RESIZE
+    chmod 755 "$KALI_ROOT/usr/local/sbin/cz-firstboot-resize.sh"
+    cat > "$KALI_ROOT/etc/systemd/system/cz-firstboot-resize.service" <<'RUNIT'
+[Unit]
+Description=Grow root filesystem to fill the SD card (first boot)
+Documentation=https://github.com/n0xa/M5CZ-Kali-Graft
+ConditionPathExists=!/var/lib/cz-graft/.resized
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cz-firstboot-resize.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+RUNIT
+    mkdir -p "$KALI_ROOT/etc/systemd/system/multi-user.target.wants"
+    ln -sf /etc/systemd/system/cz-firstboot-resize.service \
+        "$KALI_ROOT/etc/systemd/system/multi-user.target.wants/cz-firstboot-resize.service"
+    ok "First-boot rootfs-resize service installed + enabled"
+
     ok "Tweaks applied"
 }
 
@@ -1298,21 +1539,73 @@ stage_verify() {
         [[ -f "$KALI_BOOT/$f" ]] || vfail "missing boot file: $f"
     done
 
+    # Kernel <-> modules match. THE check that would have caught the 2026-06
+    # donor skew: a moving "latest" donor bumped kernel8.img to 6.18.29 while the
+    # rootfs still carried 6.12.75 modules (left over from re-running on an old
+    # image), so the kernel booted with ZERO loadable drivers — black LCD, no
+    # HDMI, no network. The boot kernel's version string MUST have a matching
+    # /lib/modules/<ver> dir or the image is dead on arrival.
+    local kver
+    # `|| true`: grep -m1 closes the pipe on first match, SIGPIPE-ing strings,
+    # which returns 141 under `set -o pipefail` — harmless here (the value is
+    # already captured), so don't let it abort the build.
+    kver=$( { zcat "$KALI_BOOT/kernel8.img" 2>/dev/null || cat "$KALI_BOOT/kernel8.img"; } \
+            | strings 2>/dev/null | grep -m1 'Linux version' | awk '{print $3}' ) || true
+    if [[ -z "$kver" ]]; then
+        vfail "could not read kernel8.img version (cannot verify kernel<->modules match)"
+    elif [[ ! -d "$KALI_ROOT/lib/modules/$kver" ]]; then
+        vfail "kernel8.img is $kver but rootfs has no /lib/modules/$kver — donor skew, image boots with NO drivers. Have: $(ls "$KALI_ROOT/lib/modules" 2>/dev/null | tr '\n' ' ')"
+    else
+        ok "kernel8.img $kver matches /lib/modules/$kver"
+    fi
+
     # Configs reference our overlays
     grep -q '^dtoverlay=cardputerzero-overlay' "$KALI_BOOT/config.txt" || vfail "cardputerzero-overlay not in config.txt"
     ! grep -q '^kernel=u-boot.bin'             "$KALI_BOOT/config.txt" || vfail "stale kernel=u-boot.bin in config.txt (should boot kernel8.img directly)"
     grep -q 'root=PARTUUID='                   "$KALI_BOOT/cmdline.txt" || vfail "cmdline.txt has no root=PARTUUID"
 
+    # Confirm we installed our patched cardputerzero-overlay (num-cs=2) and
+    # not the donor's stock one (num-cs=3) that collides with the LoRa cap's
+    # BUSY signal on GPIO22. dtc isn't always available in the build host so
+    # we compare against the known size of our vendored fix (6790 bytes).
+    if command -v dtc >/dev/null 2>&1; then
+        dtc -I dtb -O dts "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo" 2>/dev/null \
+            | grep -q 'num-cs = <0x02>' \
+            || vfail "installed cardputerzero-overlay still has num-cs != 2 (GPIO22 collides with LoRa cap)"
+    else
+        local cz_ovl_sz; cz_ovl_sz=$(stat -c %s "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo" 2>/dev/null || echo 0)
+        [[ "$cz_ovl_sz" -eq 6790 ]] \
+            || vfail "cardputerzero-overlay.dtbo size $cz_ovl_sz != expected 6790 (likely stock M5 with the GPIO22 CS2 conflict)"
+    fi
+
     # bq27220: must NOT have an overlay, driver, or any sysfs binding. The chip
     # has no in-tree Linux driver; APPLaunch reads it directly via /dev/i2c-1.
     ! grep -q '^dtoverlay=bq27220'        "$KALI_BOOT/config.txt"                                    || vfail "stale dtoverlay=bq27220 in config.txt (no in-tree driver — remove it)"
     [[ ! -f "$KALI_BOOT/overlays/bq27220.dtbo" ]]                                                    || vfail "stale bq27220.dtbo in /boot/overlays (no in-tree driver — remove it)"
-    [[ ! -f "$KALI_ROOT/usr/lib/modules/6.12.75+rpt-rpi-v8/kernel/drivers/power/supply/bq27xxx_battery.ko" ]] \
+    [[ ! -f "$KALI_ROOT/usr/lib/modules/$kver/kernel/drivers/power/supply/bq27xxx_battery.ko" ]] \
         || vfail "stale bq27xxx_battery.ko in rootfs (out-of-tree binary, no GPL source — remove it)"
 
     # /dev/i2c-1 autoload (APPLaunch's bq27220 reader needs it)
     grep -qx 'i2c-dev' "$KALI_ROOT/etc/modules-load.d/i2c-dev.conf" 2>/dev/null \
         || vfail "i2c-dev not in /etc/modules-load.d/i2c-dev.conf (APPLaunch will see no battery)"
+
+    # ALSA routing must point default at hw:1,0 (ES8389) via softvol, or no
+    # audio app works ("Unknown PCM cards.pcm.front") and alsamixer has no
+    # adjustable controls (kernel codec module exposes none natively).
+    grep -q 'slave.pcm "hw:1,0"' "$KALI_ROOT/etc/asound.conf" 2>/dev/null \
+        || vfail "asound.conf missing or not routed at hw:1,0 (audio will be silent)"
+
+    # gpsd config + service state must be ready for the LoRa+GNSS cap.
+    # serial-getty@ttyS0 must be masked or it'll fight gpsd for /dev/ttyS0
+    # at every boot and the LoRa cap's GPS will appear dead.
+    grep -q '^DEVICES="/dev/ttyS0"' "$KALI_ROOT/etc/default/gpsd" 2>/dev/null \
+        || vfail "/etc/default/gpsd not pointed at /dev/ttyS0 (LoRa cap GPS won't be readable)"
+    [[ -L "$KALI_ROOT/etc/systemd/system/serial-getty@ttyS0.service" \
+       && "$(readlink "$KALI_ROOT/etc/systemd/system/serial-getty@ttyS0.service")" == "/dev/null" ]] \
+        || vfail "serial-getty@ttyS0 not masked (will steal ttyS0 from gpsd on boot)"
+    [[ -L "$KALI_ROOT/etc/systemd/system/multi-user.target.wants/gpsd.service" \
+       || -L "$KALI_ROOT/etc/systemd/system/sockets.target.wants/gpsd.socket" ]] \
+        || vfail "gpsd not enabled at boot (LoRa cap GPS won't auto-start)"
 
     # /etc/environment must carry GLYCIN_SANDBOX_MECHANISM so pam_env propagates
     # it into lightdm X sessions (without it, pcmanfm fails to load the
@@ -1337,23 +1630,42 @@ stage_verify() {
         || vfail "ipa_rpi_vc4.so missing (camera applet will be black)"
     [[ -f "$KALI_ROOT/usr/libexec/aarch64-linux-gnu/libcamera/raspberrypi_ipa_proxy" ]] \
         || vfail "raspberrypi_ipa_proxy missing (IPA can't be hosted)"
-    [[ -f "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera.so.0.7.0" ]] \
-        || vfail "libcamera 0.7.0 (Pi-patched) missing — IPA needs CnnEnableInputTensor symbol"
-    # The soname must resolve to M5's 0.7.0, not Kali's 0.7.1 — if Kali's
-    # leaked back into /usr/lib, ldconfig will alphabetically/numerically pick
-    # it and the IPA load fails with an undefined-symbol error.
-    if [[ -L "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera.so.0.7" ]]; then
-        [[ "$(readlink "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera.so.0.7")" == "libcamera.so.0.7.0" ]] \
-            || vfail "libcamera.so.0.7 soname does not point at 0.7.0 (camera will use Kali ABI and fail)"
+    # libcamera: the Pi-patched build lifted from the donor must be the one in
+    # /usr/lib. Version derived from the donor (M5 bumps it: 0.7.0 -> 0.7.1 -> …),
+    # which may now equal Kali's number but with the Pi patches Kali lacks.
+    local m5lc m5maj
+    m5lc=$(basename "$(ls "$CZ_ROOT"/usr/lib/aarch64-linux-gnu/libcamera.so.[0-9]*.[0-9]*.[0-9]* 2>/dev/null | sort -V | tail -1)" 2>/dev/null | sed 's/^libcamera\.so\.//') || true
+    if [[ -z "$m5lc" ]]; then
+        vfail "could not determine donor libcamera version"
+    else
+        m5maj="${m5lc%.*}"   # 0.7.1 -> 0.7
+        [[ -f "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera.so.$m5lc" ]] \
+            || vfail "libcamera $m5lc (M5 Pi-patched) missing — IPA needs CnnEnableInputTensor symbol"
+        if [[ -L "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera.so.$m5maj" ]]; then
+            [[ "$(readlink "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera.so.$m5maj")" == "libcamera.so.$m5lc" ]] \
+                || vfail "libcamera.so.$m5maj soname not pointed at $m5lc (camera would use wrong ABI)"
+        fi
+        # No OTHER versioned libcamera should linger (Kali's was moved to backup).
+        for other in "$KALI_ROOT"/usr/lib/aarch64-linux-gnu/libcamera.so.[0-9]*.[0-9]*.[0-9]*; do
+            if [[ -f "$other" && "$(basename "$other")" != "libcamera.so.$m5lc" ]]; then
+                vfail "stale $(basename "$other") in /usr/lib (ldconfig may pick it over $m5lc)"
+            fi
+        done
     fi
-    [[ ! -f "$KALI_ROOT/usr/lib/aarch64-linux-gnu/libcamera.so.0.7.1" ]] \
-        || vfail "Stale libcamera.so.0.7.1 still in /usr/lib — ldconfig will pick it over 0.7.0"
 
     # M5 modules
-    for mod in pwm_bl_m5stack es8389_m5stack st7789v_m5stack tca8418_keypad_m5stack py32ioexp; do
-        [[ -f "$KALI_ROOT/usr/lib/modules/6.12.75+rpt-rpi-v8/extra/$mod.ko" ]] \
+    for mod in pwm_bl_m5stack es8389_m5stack st7789v_m5stack tca8418_keypad_m5stack m5ioe1; do
+        [[ -f "$KALI_ROOT/usr/lib/modules/$kver/extra/$mod.ko" ]] \
             || vfail "M5 module missing: $mod.ko"
     done
+
+    # First-boot rootfs grow (cloud-init is disabled, so this is what fills the card)
+    [[ -x "$KALI_ROOT/usr/local/sbin/cz-firstboot-resize.sh" ]] \
+        || vfail "cz-firstboot-resize.sh missing (rootfs won't auto-grow on first boot)"
+    [[ -L "$KALI_ROOT/etc/systemd/system/multi-user.target.wants/cz-firstboot-resize.service" ]] \
+        || vfail "cz-firstboot-resize.service not enabled (rootfs won't auto-grow)"
+    [[ -x "$KALI_ROOT/usr/bin/growpart" || -x "$KALI_ROOT/usr/local/bin/growpart" ]] \
+        || vfail "growpart not in image (cloud-guest-utils) — first-boot resize will no-op"
 
     # APPLaunch
     [[ -x "$KALI_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch" ]] \
@@ -1603,6 +1915,7 @@ STAGES=("$@")
 run_stage() {
     case "$1" in
         check)     stage_check ;;
+        drift)     check_donor_drift ;;
         donor)     stage_check; stage_donor ;;
         unxz)      stage_check; stage_unxz ;;
         resize)    stage_check; stage_unxz; stage_resize ;;
