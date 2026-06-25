@@ -49,8 +49,8 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CZ_BASE_URL="${CZ_BASE_URL:-https://cardputer-zero-repo.oss-cn-shenzhen.aliyuncs.com/cardputerzero-trixie-arm64-latest.img.xz}"
 # Pinned donor version. Bump deliberately when recalibrating to a newer image
 # (get the new id from: curl -sI <CZ_BASE_URL> | grep -i x-oss-version-id).
-#   pinned: 2026-06-01 publish — kernel 6.18.29+rpt-rpi-v8
-CZ_VERSION_ID="${CZ_VERSION_ID:-CAEQgwEYgYCAzK_AhPQZIiBmOTBjYWI5NjZkNDM0Mjk0YTQ5MzU5ZWIzZGU1MjgwZQ--}"
+#   pinned: 2026-06-08 publish — kernel 6.18.33+rpt-rpi-v8
+CZ_VERSION_ID="${CZ_VERSION_ID:-CAEQjAEYgYDApKSfmfUZIiAwNzNhNWNmZWU5YjE0NWU3ODE1MDE0YjE1MzY2MjBhMA--}"
 CZ_URL="${CZ_URL:-${CZ_BASE_URL}?versionId=${CZ_VERSION_ID}}"
 CZ_XZ="${CZ_XZ:-$SCRIPT_DIR/cardputerzero-trixie-arm64-latest.img.xz}"
 CZ_IMG="${CZ_IMG:-${CZ_XZ%.xz}}"
@@ -473,6 +473,46 @@ stage_rootfs() {
     if (( rebuild_depmod )); then
         log "Rebuilding modules.dep (depmod) for $KVER"
         depmod -b "$KALI_ROOT" "$KVER"
+    fi
+
+    # Kernel headers: copy from the donor so the /lib/modules/<kver>/build
+    # symlink resolves inside the Kali rootfs. Required for out-of-tree module
+    # builds (e.g. realtek-rtl88xxau for the AWUS036ACS). The donor ships these
+    # as installed dpkg packages; we copy directly without dpkg registration
+    # (the kernel is held, so no version conflict can arise at runtime).
+    #
+    # Package layout:
+    #   linux-headers-<kver-base>+rpt-common-rpi  → /usr/src/  (arch-independent)
+    #   linux-headers-<KVER>                       → /usr/src/  (arch-specific)
+    #   linux-kbuild-<kver-base>+rpt               → /usr/lib/  (kbuild scripts/tools)
+    # The common-rpi Makefile's 'scripts' entry is a symlink into /usr/lib/linux-kbuild-*/
+    local kver_base="${KVER%%+*}"  # "6.18.33+rpt-rpi-v8" -> "6.18.33"
+    for hdr in \
+        "linux-headers-${kver_base}+rpt-common-rpi" \
+        "linux-headers-${KVER}"
+    do
+        local hdr_dst="$KALI_ROOT/usr/src/$hdr"
+        local hdr_src="$CZ_ROOT/usr/src/$hdr"
+        if [[ -d "$hdr_dst" ]]; then
+            ok "Kernel headers already present: $hdr — skipping"
+        elif [[ -d "$hdr_src" ]]; then
+            cp -a "$hdr_src" "$KALI_ROOT/usr/src/"
+            ok "Copied $(du -sh "$hdr_dst" | cut -f1): $hdr"
+        else
+            warn "Donor missing kernel headers: $hdr (module builds will fail)"
+        fi
+    done
+    # linux-kbuild installs to /usr/lib/, not /usr/src/
+    local kbuild_name="linux-kbuild-${kver_base}+rpt"
+    local kbuild_dst="$KALI_ROOT/usr/lib/$kbuild_name"
+    local kbuild_src="$CZ_ROOT/usr/lib/$kbuild_name"
+    if [[ -d "$kbuild_dst" ]]; then
+        ok "Kbuild scripts already present: $kbuild_name — skipping"
+    elif [[ -d "$kbuild_src" ]]; then
+        cp -a "$kbuild_src" "$KALI_ROOT/usr/lib/"
+        ok "Copied $(du -sh "$kbuild_dst" | cut -f1): $kbuild_name (kbuild scripts)"
+    else
+        warn "Donor missing $kbuild_name at /usr/lib/ (module builds will fail)"
     fi
 
     # CM0-specific Broadcom firmware (brcm/ tree)
@@ -903,8 +943,10 @@ stage_packages() {
        && -x "$KALI_ROOT/usr/bin/ffmpeg" \
        && -x "$KALI_ROOT/usr/bin/gpioset" \
        && -f "$KALI_ROOT/home/kali/.ssh/authorized_keys" ]] \
-       && grep -q '^kali:' "$KALI_ROOT/etc/passwd"; then
-        ok "Desktop packages + kali user + SSH key all present — skipping"
+       && grep -q '^kali:' "$KALI_ROOT/etc/passwd" \
+       && find "$KALI_ROOT/usr/lib/modules" -name '88XXau.ko*' \
+               -path '*/updates/dkms/*' -not -path '*/6.12.*' 2>/dev/null | grep -q .; then
+        ok "Desktop packages + kali user + SSH key + 88XXau all present — skipping"
         return
     fi
 
@@ -946,6 +988,12 @@ stage_packages() {
         LC_ALL=C \
         bash -e <<'CHROOT'
 apt-get update
+
+# gcc + make must land before realtek-rtl88xxau-dkms triggers the DKMS build.
+# dkms doesn't declare gcc as a dependency (it's expected to be present), so a
+# single combined apt-get could configure rtl88xxau-dkms before gcc is ready.
+apt-get install -y --no-install-recommends gcc make
+
 apt-get install -y --no-install-recommends \
     -o Dpkg::Options::="--force-confold" \
     -o Dpkg::Options::="--force-confdef" \
@@ -959,7 +1007,113 @@ apt-get install -y --no-install-recommends \
     gpiod \
     pipewire-alsa \
     gpsd \
-    gpsd-clients
+    gpsd-clients \
+    realtek-rtl88xxau-dkms
+
+# DKMS skips the 6.18.33 kernel due to BUILD_EXCLUSIVE_KERNEL in dkms.conf,
+# and its /var/lib/dkms/rtl88xxau/<ver>/source symlink is never created (so
+# 'dkms install' can't find the source either). Build the module directly with
+# make against the transplanted 6.18.33 kernel headers — same thing DKMS would
+# call internally, just without the DKMS orchestration layer.
+# Source dir: Kali uses 'realtek-rtl88xxau-<ver>' (Debian src pkg name).
+RTL_SRC=$(ls -d /usr/src/*rtl88xxau-* 2>/dev/null | sort -V | tail -1)
+CZ_KVER=$(ls /lib/modules/ | grep '+rpt-rpi-v8$' | sort -V | tail -1)
+if [ -n "$RTL_SRC" ] && [ -n "$CZ_KVER" ]; then
+    # The donor kernel headers reference aarch64-linux-gnu-gcc-14 but Kali ships
+    # gcc-15. Shim the versioned names so kbuild resolves them correctly.
+    for _t in gcc gcc-ar gcc-nm gcc-ranlib; do
+        [ -e "/usr/bin/aarch64-linux-gnu-${_t}-14" ] || \
+            ln -sf "aarch64-linux-gnu-${_t}-15" "/usr/bin/aarch64-linux-gnu-${_t}-14"
+    done
+    # 6.18.33 kbuild dropped EXTRA_CFLAGS support (replaced by ccflags-y).
+    # The driver's Makefile uses EXTRA_CFLAGS throughout; patch it before building.
+    sed -i 's/^EXTRA_CFLAGS\b/ccflags-y/g; s/^EXTRA_LDFLAGS\b/ldflags-y/g' \
+        "$RTL_SRC/Makefile"
+    # Kernel 6.16 removed from_timer() (→ timer_container_of) and del_timer_sync()
+    # (→ timer_delete_sync). Write a compat shim and inject it into the affected header.
+    cat > "$RTL_SRC/include/rtw_compat_6_16.h" <<'COMPAT'
+/* Compat shims for kernel 6.16+ which removed from_timer() and del_timer_sync() */
+#ifndef RTW_COMPAT_6_16_H
+#define RTW_COMPAT_6_16_H
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+# ifndef from_timer
+#  define from_timer(var, cb, field) timer_container_of(var, cb, field)
+# endif
+# ifndef del_timer_sync
+#  define del_timer_sync(t) timer_delete_sync(t)
+# endif
+#endif
+#endif /* RTW_COMPAT_6_16_H */
+COMPAT
+    grep -q 'rtw_compat_6_16.h' "$RTL_SRC/include/osdep_service_linux.h" || \
+        sed -i '/#define __OSDEP_LINUX_SERVICE_H_/a #include "rtw_compat_6_16.h"' \
+            "$RTL_SRC/include/osdep_service_linux.h"
+    # Kernel 6.17 added int radio_idx to set_wiphy_params, set_tx_power, get_tx_power
+    # cfg80211_ops callbacks. Patch the driver's ioctl_cfg80211.c signatures to match.
+    # Use a Python patcher so multiline declarations are handled safely.
+    cat > /tmp/patch_cfg80211.py <<'PYPATCH'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    c = f.read()
+orig = c
+
+def patch(c, old, new, label):
+    if old in c:
+        print(f'Patched {label}')
+        return c.replace(old, new, 1)
+    elif new in c:
+        print(f'Already patched {label}')
+        return c
+    else:
+        print(f'WARNING: no match for {label}')
+        return c
+
+# set_wiphy_params: add radio_idx between wiphy and u32 changed
+c = patch(c,
+    'cfg80211_rtw_set_wiphy_params(struct wiphy *wiphy, u32 changed)',
+    'cfg80211_rtw_set_wiphy_params(struct wiphy *wiphy, int radio_idx __maybe_unused, u32 changed)',
+    'set_wiphy_params')
+
+# set_tx_power: add radio_idx between the #endif/#if guards
+# (declaration has #if guards between params so regex can't span them)
+c = patch(c,
+    '#endif\n#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 36)) || defined(COMPAT_KERNEL_RELEASE)\n\tenum nl80211_tx_power_setting type, int mbm)',
+    '#endif\n\tint radio_idx __maybe_unused,\n#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 36)) || defined(COMPAT_KERNEL_RELEASE)\n\tenum nl80211_tx_power_setting type, int mbm)',
+    'set_tx_power')
+
+# get_tx_power: add radio_idx before the #if >= 6.14.0 link_id block
+c = patch(c,
+    '#endif\n#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0))\n\tunsigned int link_id,',
+    '#endif\n\tint radio_idx __maybe_unused,\n#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0))\n\tunsigned int link_id,',
+    'get_tx_power')
+
+with open(path, 'w') as f:
+    f.write(c)
+print(f'Done — {"changes made" if c != orig else "no changes"}')
+sys.exit(0)
+PYPATCH
+    python3 /tmp/patch_cfg80211.py "$RTL_SRC/os_dep/linux/ioctl_cfg80211.c" \
+        || echo "[rtl88xxau] NOTE: cfg80211 patch had no effect (may already be applied)"
+    # Build directly in the source dir, exactly as DKMS does.
+    if (cd "$RTL_SRC" && make KVER="$CZ_KVER" KSRC="/lib/modules/$CZ_KVER/build"); then
+        KO=$(find "$RTL_SRC" -name '88XXau.ko' | head -1)
+        if [ -n "$KO" ]; then
+            mkdir -p "/lib/modules/$CZ_KVER/updates/dkms"
+            cp "$KO" "/lib/modules/$CZ_KVER/updates/dkms/88XXau.ko"
+            depmod "$CZ_KVER"
+            echo "[rtl88xxau] Built and installed 88XXau.ko for $CZ_KVER"
+        else
+            echo "[rtl88xxau] WARNING: make succeeded but 88XXau.ko not found"
+            find "$RTL_SRC" -name '*.ko' 2>/dev/null | sed 's/^/  found: /'
+        fi
+    else
+        echo "[rtl88xxau] WARNING: manual build failed for $CZ_KVER"
+    fi
+else
+    echo "[rtl88xxau] WARNING: source (${RTL_SRC:-none}) or kernel (${CZ_KVER:-none}) not found"
+fi
 
 # Pre-create the kali user with password 'kali' instead of relying on
 # cloud-init. Kali's stock Pi image is cloud-init-based — datasource setup
@@ -1042,6 +1196,8 @@ apt-mark hold \
     kali-linux-firmware \
     linux-image-rpi-v8 \
     linux-image-rpi-2712 \
+    linux-headers-rpi-v8 \
+    linux-headers-rpi-2712 \
     libcamera0.7
 
 # Re-assert the M5 Pi-patched libcamera lift. apt (just above) installed Kali's
@@ -1057,6 +1213,31 @@ done
 rm -f /usr/lib/aarch64-linux-gnu/libcamera.so.[0-9]* /usr/lib/aarch64-linux-gnu/libcamera-base.so.[0-9]*
 cp -af /root/m5-libcamera-pinned/. /usr/lib/aarch64-linux-gnu/ 2>/dev/null
 ldconfig
+
+# Disable glycin's image THUMBNAILERS + the SVG loader. Two related upstream
+# glycin bugs bite this aarch64/Pi-Zero-2-W combo, both as bwrap+seccomp
+# livelocks at 100% CPU:
+#   1) glycin-svg livelocks single-shot — pcmanfm's desktop spawns it to
+#      thumbnail one SVG icon and a render thread spins forever.
+#   2) ANY glycin thumbnailer (image-rs, heif, jxl, svg) PILES UP when a file
+#      manager browses a directory of images: one bwrap+loader is forked per
+#      file, each wedges + holds ~50-60 MB, and on the 512 MB CM0 a few hundred
+#      drives load past 20 and the OOM killer starts taking the desktop session
+#      (pipewire/dbus/wireplumber) while the box thrashes for hours. Observed
+#      live: a wardrive left running overnight pulled glycin-image-rs into this
+#      pileup. Kismet survived (it's a system unit), but the desktop session
+#      died and the UI falsely read "stopped".
+# Fix: divert EVERY glycin thumbnailer (kills the pileup trigger) plus the svg
+# *loader* conf.d (kills the single-shot icon livelock). The non-svg loader
+# conf.d entries are left in place so glycin-image-rs still paints the JPEG
+# wallpaper single-shot (it doesn't livelock that way; only repeated
+# thumbnailing piles up). Diverts are durable across apt upgrades + reversible.
+for f in $(ls /usr/share/thumbnailers/glycin-*.thumbnailer 2>/dev/null) \
+         $(ls /usr/share/glycin-loaders/*/conf.d/glycin-svg.conf 2>/dev/null); do
+    if [ -e "$f" ]; then
+        dpkg-divert --rename --divert "$f.disabled" --add "$f" || true
+    fi
+done
 
 # ── Memory diet: disable autostart bloat (~110 MB savings on the 415 MB CM0)
 # Each unwanted .desktop gets a "Hidden=true" line appended, which suppresses
@@ -1658,6 +1839,14 @@ stage_verify() {
         [[ -f "$KALI_ROOT/usr/lib/modules/$kver/extra/$mod.ko" ]] \
             || vfail "M5 module missing: $mod.ko"
     done
+
+    # AWUS036ACS (RTL8811AU) driver built by DKMS in stage_packages.
+    # Installed to updates/dkms/ by DKMS postinst; absent means the DKMS build
+    # failed (usually: headers not copied from donor before stage_packages ran,
+    # or gcc/make not available in the chroot when rtl88xxau-dkms was configured).
+    find "$KALI_ROOT/usr/lib/modules" -name '88XXau.ko*' \
+            -path '*/updates/dkms/*' -not -path '*/6.12.*' 2>/dev/null | grep -q . \
+        || vfail "88XXau.ko missing for M5 boot kernel (DKMS build failed — AWUS036ACS won't work)"
 
     # First-boot rootfs grow (cloud-init is disabled, so this is what fills the card)
     [[ -x "$KALI_ROOT/usr/local/sbin/cz-firstboot-resize.sh" ]] \
