@@ -819,6 +819,40 @@ EOF
 i2c-dev
 EOF
 
+    # rtw88 vs out-of-tree Realtek DKMS drivers:
+    # Kernel 6.18 added in-tree rtw88_8821au (covers 0bda:0811 AWUS036ACS) and
+    # rtw88_8822bu. These win the modalias race and prevent 88XXau.ko from loading.
+    # Blacklist the in-tree variants so our DKMS builds have a clear path.
+    mkdir -p "$KALI_ROOT/etc/modprobe.d"
+    cat > "$KALI_ROOT/etc/modprobe.d/rtw88-dkms-override.conf" <<'EOF'
+# Blacklist in-tree rtw88 USB drivers that conflict with out-of-tree DKMS builds.
+# 88XXau (aircrack-ng fork) has better injection/monitor than rtw88_8821au.
+# rtw88_8822bu intentionally omitted — no replacement 88XXBu driver yet.
+blacklist rtw88_8821au
+blacklist rtw88_8821a
+blacklist rtw88_88xxa
+blacklist rtw88_8812au
+blacklist rtw88_8814au
+EOF
+
+    # 88XXau has no MODULE_DEVICE_TABLE exports, so udev cannot auto-load it via
+    # modalias. Load it at boot (covers pre-connected adapters) and via udev rule
+    # (covers hot-plug). The module's internal id_table claims the device on load.
+    cat > "$KALI_ROOT/etc/modules-load.d/rtw88xxau.conf" <<'EOF'
+# Out-of-tree Realtek 8811/8821AU driver (aircrack-ng fork, monitor/inject support).
+# rtw88_8821au is blacklisted; this module claims the adapter at probe time.
+88XXau
+EOF
+
+    mkdir -p "$KALI_ROOT/etc/udev/rules.d"
+    cat > "$KALI_ROOT/etc/udev/rules.d/99-rtw88xxau.rules" <<'EOF'
+# Hot-plug loader for out-of-tree 88XXau driver (no MODULE_ALIAS, so udev won't
+# find it via modalias). Matches Realtek 8811/8821AU USB IDs.
+ACTION=="add", SUBSYSTEM=="usb", DEVTYPE=="usb_device", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="0811", RUN+="/usr/sbin/modprobe 88XXau"
+ACTION=="add", SUBSYSTEM=="usb", DEVTYPE=="usb_device", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="8822", RUN+="/usr/sbin/modprobe 88XXau"
+ACTION=="add", SUBSYSTEM=="usb", DEVTYPE=="usb_device", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="a811", RUN+="/usr/sbin/modprobe 88XXau"
+EOF
+
     # Audio routing. Two ALSA cards register at boot — card 0 is vc4hdmi
     # (CZ has no physical HDMI sink, opens fail with ENOSTR), card 1 is the
     # ES8389 codec driven by es8389_m5stack.ko + the cardputerzero-overlay's
@@ -1010,28 +1044,14 @@ apt-get install -y --no-install-recommends \
     gpsd-clients \
     realtek-rtl88xxau-dkms
 
-# DKMS skips the 6.18.33 kernel due to BUILD_EXCLUSIVE_KERNEL in dkms.conf,
-# and its /var/lib/dkms/rtl88xxau/<ver>/source symlink is never created (so
-# 'dkms install' can't find the source either). Build the module directly with
-# make against the transplanted 6.18.33 kernel headers — same thing DKMS would
-# call internally, just without the DKMS orchestration layer.
-# Source dir: Kali uses 'realtek-rtl88xxau-<ver>' (Debian src pkg name).
-RTL_SRC=$(ls -d /usr/src/*rtl88xxau-* 2>/dev/null | sort -V | tail -1)
-CZ_KVER=$(ls /lib/modules/ | grep '+rpt-rpi-v8$' | sort -V | tail -1)
-if [ -n "$RTL_SRC" ] && [ -n "$CZ_KVER" ]; then
-    # The donor kernel headers reference aarch64-linux-gnu-gcc-14 but Kali ships
-    # gcc-15. Shim the versioned names so kbuild resolves them correctly.
-    for _t in gcc gcc-ar gcc-nm gcc-ranlib; do
-        [ -e "/usr/bin/aarch64-linux-gnu-${_t}-14" ] || \
-            ln -sf "aarch64-linux-gnu-${_t}-15" "/usr/bin/aarch64-linux-gnu-${_t}-14"
-    done
-    # 6.18.33 kbuild dropped EXTRA_CFLAGS support (replaced by ccflags-y).
-    # The driver's Makefile uses EXTRA_CFLAGS throughout; patch it before building.
-    sed -i 's/^EXTRA_CFLAGS\b/ccflags-y/g; s/^EXTRA_LDFLAGS\b/ldflags-y/g' \
-        "$RTL_SRC/Makefile"
-    # Kernel 6.16 removed from_timer() (→ timer_container_of) and del_timer_sync()
-    # (→ timer_delete_sync). Write a compat shim and inject it into the affected header.
-    cat > "$RTL_SRC/include/rtw_compat_6_16.h" <<'COMPAT'
+# Build Realtek out-of-tree drivers against the transplanted 6.18.33 kernel.
+# DKMS skips 6.18.33 due to BUILD_EXCLUSIVE_KERNEL="^6\.12\..*" in its dkms.conf.
+# We: (1) patch sources for 6.16–6.18 API changes, (2) strip BUILD_EXCLUSIVE so
+# DKMS can manage the kernel going forward, (3) register + install via DKMS so
+# future kernel upgrades trigger auto-rebuild, falling back to raw make if needed.
+#
+# Shared compat files written once, used by all driver builds below.
+cat > /tmp/rtw_compat_6_16.h <<'COMPAT'
 /* Compat shims for kernel 6.16+ which removed from_timer() and del_timer_sync() */
 #ifndef RTW_COMPAT_6_16_H
 #define RTW_COMPAT_6_16_H
@@ -1046,13 +1066,10 @@ if [ -n "$RTL_SRC" ] && [ -n "$CZ_KVER" ]; then
 #endif
 #endif /* RTW_COMPAT_6_16_H */
 COMPAT
-    grep -q 'rtw_compat_6_16.h' "$RTL_SRC/include/osdep_service_linux.h" || \
-        sed -i '/#define __OSDEP_LINUX_SERVICE_H_/a #include "rtw_compat_6_16.h"' \
-            "$RTL_SRC/include/osdep_service_linux.h"
-    # Kernel 6.17 added int radio_idx to set_wiphy_params, set_tx_power, get_tx_power
-    # cfg80211_ops callbacks. Patch the driver's ioctl_cfg80211.c signatures to match.
-    # Use a Python patcher so multiline declarations are handled safely.
-    cat > /tmp/patch_cfg80211.py <<'PYPATCH'
+
+# Python patcher for cfg80211_ops signatures (kernel 6.17+ added int radio_idx).
+# Uses str.replace — regex can't span the #if guards between params.
+cat > /tmp/patch_cfg80211.py <<'PYPATCH'
 import sys
 path = sys.argv[1]
 with open(path) as f:
@@ -1070,20 +1087,14 @@ def patch(c, old, new, label):
         print(f'WARNING: no match for {label}')
         return c
 
-# set_wiphy_params: add radio_idx between wiphy and u32 changed
 c = patch(c,
     'cfg80211_rtw_set_wiphy_params(struct wiphy *wiphy, u32 changed)',
     'cfg80211_rtw_set_wiphy_params(struct wiphy *wiphy, int radio_idx __maybe_unused, u32 changed)',
     'set_wiphy_params')
-
-# set_tx_power: add radio_idx between the #endif/#if guards
-# (declaration has #if guards between params so regex can't span them)
 c = patch(c,
     '#endif\n#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 36)) || defined(COMPAT_KERNEL_RELEASE)\n\tenum nl80211_tx_power_setting type, int mbm)',
     '#endif\n\tint radio_idx __maybe_unused,\n#if (LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 36)) || defined(COMPAT_KERNEL_RELEASE)\n\tenum nl80211_tx_power_setting type, int mbm)',
     'set_tx_power')
-
-# get_tx_power: add radio_idx before the #if >= 6.14.0 link_id block
 c = patch(c,
     '#endif\n#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0))\n\tunsigned int link_id,',
     '#endif\n\tint radio_idx __maybe_unused,\n#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0))\n\tunsigned int link_id,',
@@ -1094,26 +1105,82 @@ with open(path, 'w') as f:
 print(f'Done — {"changes made" if c != orig else "no changes"}')
 sys.exit(0)
 PYPATCH
-    python3 /tmp/patch_cfg80211.py "$RTL_SRC/os_dep/linux/ioctl_cfg80211.c" \
-        || echo "[rtl88xxau] NOTE: cfg80211 patch had no effect (may already be applied)"
-    # Build directly in the source dir, exactly as DKMS does.
-    if (cd "$RTL_SRC" && make KVER="$CZ_KVER" KSRC="/lib/modules/$CZ_KVER/build"); then
-        KO=$(find "$RTL_SRC" -name '88XXau.ko' | head -1)
-        if [ -n "$KO" ]; then
-            mkdir -p "/lib/modules/$CZ_KVER/updates/dkms"
-            cp "$KO" "/lib/modules/$CZ_KVER/updates/dkms/88XXau.ko"
-            depmod "$CZ_KVER"
-            echo "[rtl88xxau] Built and installed 88XXau.ko for $CZ_KVER"
+
+# Helper: patch + DKMS-register + build one Realtek aircrack-ng fork driver.
+#   $1  glob under /usr/src/  e.g. '*rtl88xxau-*'
+#   $2  .ko filename           e.g. '88XXau.ko'
+#   $3  label                  e.g. 'rtl88xxau'
+build_rtl_drv() {
+    local pat="$1" ko_name="$2" label="$3"
+    local src kver
+    src=$(ls -d /usr/src/$pat 2>/dev/null | sort -V | tail -1)
+    kver=$(ls /lib/modules/ | grep '+rpt-rpi-v8$' | sort -V | tail -1)
+    if [ -z "$src" ] || [ -z "$kver" ]; then
+        echo "[$label] WARNING: source (${src:-none}) or kernel (${kver:-none}) not found"
+        return
+    fi
+
+    # gcc-14 shims: donor kernel headers hardcode gcc-14, Kali ships gcc-15.
+    for _t in gcc gcc-ar gcc-nm gcc-ranlib; do
+        [ -e "/usr/bin/aarch64-linux-gnu-${_t}-14" ] || \
+            ln -sf "aarch64-linux-gnu-${_t}-15" "/usr/bin/aarch64-linux-gnu-${_t}-14"
+    done
+
+    # kbuild 6.18 dropped EXTRA_CFLAGS — must be ccflags-y.
+    sed -i 's/^EXTRA_CFLAGS\b/ccflags-y/g; s/^EXTRA_LDFLAGS\b/ldflags-y/g' "$src/Makefile"
+
+    # Timer compat header (from_timer / del_timer_sync removed in 6.16).
+    cp /tmp/rtw_compat_6_16.h "$src/include/"
+    grep -q 'rtw_compat_6_16.h' "$src/include/osdep_service_linux.h" || \
+        sed -i '/#define __OSDEP_LINUX_SERVICE_H_/a #include "rtw_compat_6_16.h"' \
+            "$src/include/osdep_service_linux.h"
+
+    # cfg80211_ops signatures (radio_idx added in 6.17).
+    python3 /tmp/patch_cfg80211.py "$src/os_dep/linux/ioctl_cfg80211.c" || \
+        echo "[$label] NOTE: cfg80211 patch had no effect"
+
+    # Strip BUILD_EXCLUSIVE_KERNEL so DKMS manages future kernel upgrades.
+    sed -i '/BUILD_EXCLUSIVE_KERNEL/d' "$src/dkms.conf"
+
+    # Register with DKMS (idempotent — 'already added' is fine).
+    local dname dver
+    dname=$(awk -F'"' '/^PACKAGE_NAME/{print $2; exit}' "$src/dkms.conf")
+    dver=$(awk -F'"' '/^PACKAGE_VERSION/{print $2; exit}' "$src/dkms.conf")
+    if [ -n "$dname" ] && [ -n "$dver" ]; then
+        dkms add -m "$dname" -v "$dver" 2>/dev/null || true
+        # Build + install via DKMS — populates the DB so 'dkms autoinstall' fires
+        # on future kernel upgrades. DKMS calls the dkms.conf MAKE line, which for
+        # these drivers is: make KVER=$kernelver KSRC=/lib/modules/$kernelver/build
+        if dkms install --force -m "$dname" -v "$dver" -k "$kver" 2>&1; then
+            depmod "$kver"
+            echo "[$label] DKMS built and installed $ko_name for $kver"
+            return
+        fi
+        echo "[$label] DKMS install failed — falling back to manual build"
+    fi
+
+    # Manual fallback (same make invocation as dkms.conf MAKE line).
+    if (cd "$src" && make KVER="$kver" KSRC="/lib/modules/$kver/build"); then
+        local ko
+        ko=$(find "$src" -name "$ko_name" | head -1)
+        if [ -n "$ko" ]; then
+            mkdir -p "/lib/modules/$kver/updates/dkms"
+            cp "$ko" "/lib/modules/$kver/updates/dkms/$ko_name"
+            depmod "$kver"
+            echo "[$label] Manual build installed $ko_name for $kver"
         else
-            echo "[rtl88xxau] WARNING: make succeeded but 88XXau.ko not found"
-            find "$RTL_SRC" -name '*.ko' 2>/dev/null | sed 's/^/  found: /'
+            echo "[$label] WARNING: make succeeded but $ko_name not found"
+            find "$src" -name '*.ko' 2>/dev/null | sed 's/^/  found: /'
         fi
     else
-        echo "[rtl88xxau] WARNING: manual build failed for $CZ_KVER"
+        echo "[$label] WARNING: manual build failed for $kver"
     fi
-else
-    echo "[rtl88xxau] WARNING: source (${RTL_SRC:-none}) or kernel (${CZ_KVER:-none}) not found"
-fi
+}
+
+# RTL8811AU / RTL8812AU / RTL8821AU — Alfa AWUS036ACS and similar
+build_rtl_drv '*rtl88xxau-*' '88XXau.ko' 'rtl88xxau'
+# RTL8812BU / RTL8822BU — TP-Link T2U, Panda PAU0D and similar
+build_rtl_drv '*rtl88x2bu-*' '88XXBu.ko' 'rtl88x2bu'
 
 # Pre-create the kali user with password 'kali' instead of relying on
 # cloud-init. Kali's stock Pi image is cloud-init-based — datasource setup
@@ -1770,6 +1837,14 @@ stage_verify() {
     grep -qx 'i2c-dev' "$KALI_ROOT/etc/modules-load.d/i2c-dev.conf" 2>/dev/null \
         || vfail "i2c-dev not in /etc/modules-load.d/i2c-dev.conf (APPLaunch will see no battery)"
 
+    # rtw88 blacklist must be present so 88XXau wins over in-tree rtw88_8821au
+    grep -q 'blacklist rtw88_8821au' "$KALI_ROOT/etc/modprobe.d/rtw88-dkms-override.conf" 2>/dev/null \
+        || vfail "rtw88-dkms-override.conf missing — rtw88_8821au will claim AWUS036ACS instead of 88XXau"
+    [[ -f "$KALI_ROOT/etc/modules-load.d/rtw88xxau.conf" ]] \
+        || vfail "rtw88xxau.conf missing — 88XXau won't auto-load at boot"
+    [[ -f "$KALI_ROOT/etc/udev/rules.d/99-rtw88xxau.rules" ]] \
+        || vfail "99-rtw88xxau.rules missing — 88XXau won't load on hot-plug"
+
     # ALSA routing must point default at hw:1,0 (ES8389) via softvol, or no
     # audio app works ("Unknown PCM cards.pcm.front") and alsamixer has no
     # adjustable controls (kernel codec module exposes none natively).
@@ -1846,7 +1921,10 @@ stage_verify() {
     # or gcc/make not available in the chroot when rtl88xxau-dkms was configured).
     find "$KALI_ROOT/usr/lib/modules" -name '88XXau.ko*' \
             -path '*/updates/dkms/*' -not -path '*/6.12.*' 2>/dev/null | grep -q . \
-        || vfail "88XXau.ko missing for M5 boot kernel (DKMS build failed — AWUS036ACS won't work)"
+        || vfail "88XXau.ko missing for M5 boot kernel (build failed — AWUS036ACS won't work)"
+    find "$KALI_ROOT/usr/lib/modules" -name '88XXBu.ko*' \
+            -path '*/updates/dkms/*' -not -path '*/6.12.*' 2>/dev/null | grep -q . \
+        || warn "88XXBu.ko not present — RTL8812BU devices (T2U, PAU0D) need manual driver install"
 
     # First-boot rootfs grow (cloud-init is disabled, so this is what fills the card)
     [[ -x "$KALI_ROOT/usr/local/sbin/cz-firstboot-resize.sh" ]] \
