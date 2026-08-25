@@ -272,67 +272,56 @@ stage_boot() {
     cp -a "$CZ_BOOT/kernel8.img"         "$KALI_BOOT/"
     cp -a "$CZ_BOOT/bcm2710-rpi-cm0.dtb" "$KALI_BOOT/"
 
-    # cardputerzero-overlay.dtbo: install OUR patched version (vendored), not
-    # the donor's. M5's stock overlay declares 3 SPI0 chip-selects with CS2
-    # mapped to GPIO22, but no overlay node consumes CS2 — it's dead weight
-    # left over from copy-paste. The conflict surfaces when you plug in M5's
-    # own LoRa SX1262 cap (Ultimate Edition Kickstarter accessory): the cap's
-    # BUSY signal lives on GPIO22 and the applet's `busy_gpio_init` fails
-    # with rc=1 because the SPI subsystem has already claimed the pin. Our
-    # patched .dtbo drops num-cs to 2, removes the third cs-gpios triplet,
-    # and cleans up the matching __fixups__ reference. Diff is ±4 lines, no
-    # other functional change. Keep the donor's original on disk as a `.m5orig`
-    # backup so users can revert if some other consumer of CS2 ever appears.
-    # Version-agnostic: patch the DONOR's own overlay at build time rather than
-    # shipping a static .dtbo that goes stale every donor bump (and that would
-    # also carry the old IO-expander binding — M5 renamed py32ioexp -> m5ioe1).
-    # Decompile, drop num-cs 3->2 + the dead CS2/GPIO22 triplet + its __fixups__
-    # ref, recompile. dtc round-trip is lossless (verified). The num-cs sed is a
-    # no-op if M5 ever fixes it upstream; stage_verify re-checks num-cs == 2.
-    local cz_ovl="$CZ_BOOT/overlays/cardputerzero-overlay.dtbo"
-    if command -v dtc >/dev/null 2>&1 && [[ -f "$cz_ovl" ]]; then
-        local ov_dts; ov_dts=$(mktemp)
-        dtc -I dtb -O dts -o "$ov_dts" "$cz_ovl" 2>/dev/null
-        sed -i \
-            -e 's/num-cs = <0x03>/num-cs = <0x02>/' \
-            -e 's/\(cs-gpios = <0xffffffff 0x08 0x01 0xffffffff 0x07 0x01\) 0xffffffff 0x16 0x01>/\1>/' \
-            -e 's/, "[^"]*:cs-gpios:24"//' \
-            "$ov_dts"
-        if dtc -I dts -O dtb -o "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo" "$ov_dts" 2>/dev/null \
-           && dtc -I dtb -O dts "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo" 2>/dev/null | grep -q 'num-cs = <0x02>'; then
-            ok "Patched cardputerzero-overlay (num-cs 3->2, dropped dead CS2/GPIO22)"
-        else
-            warn "build-time overlay patch failed — falling back to vendored .dtbo"
-            install -m644 "$SCRIPT_DIR/vendored/cardputerzero-overlay-cs2fix.dtbo" \
-                          "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo"
-        fi
-        rm -f "$ov_dts"
-        install -m644 "$cz_ovl" "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo.m5orig"
-    else
-        warn "dtc or donor overlay missing — using vendored .dtbo (may be stale for this donor)"
-        install -m644 "$SCRIPT_DIR/vendored/cardputerzero-overlay-cs2fix.dtbo" \
-                      "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo"
-        [[ -f "$cz_ovl" ]] && install -m644 "$cz_ovl" "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo.m5orig"
-    fi
+    # Clean up v2-era overlay files from a prior run of this OUT_IMG (stage_boot
+    # isn't a from-scratch rebuild — it writes onto whatever's already in
+    # KALI_BOOT). Unreferenced-but-present stale .dtbo files aren't harmful,
+    # just confusing to find on the card later.
+    rm -f "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo" \
+          "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo.m5orig" \
+          "$KALI_BOOT/overlays/lsm6ds3tr-overlay.dtbo" \
+          "$KALI_BOOT/overlays/camera-gpio16-high-overlay.dtbo" \
+          "$KALI_BOOT/overlays/spk-gpio24-high-overlay.dtbo"
 
-    # Overlays we want present: lsm6ds3tr (IMU, bound by mainline st_lsm6dsx)
-    # plus two GPIO-high overlays that M5Stack added in their 2025-05-13 image
-    # to power on the camera (GPIO16) and speaker amp (GPIO24) at DT-init time.
-    # The camera-gpio16 overlay is the suspected fix for the IMX219 sensor not
-    # ACKing i2c reads — sensor was unpowered without it. (`install` instead of
-    # `cp -a` — exfat→FAT32 ownership preservation silently fails with cp -a.)
+    # cardputerzero-v5-overlay.dtbo: install the DONOR's overlay unmodified.
     #
-    # No bq27220 overlay: the chip has no in-tree Linux driver, and the
-    # out-of-tree binary M5 ships against it isn't useful (data flash is
-    # uncalibrated, on-chip SOC is wrong regardless). APPLaunch talks to the
-    # chip directly via /dev/i2c-1 — see stage_configs for the i2c-dev autoload.
-    for ov in lsm6ds3tr-overlay.dtbo camera-gpio16-high-overlay.dtbo spk-gpio24-high-overlay.dtbo; do
-        if [[ -f "$CZ_BOOT/overlays/$ov" ]]; then
-            install -m644 "$CZ_BOOT/overlays/$ov" "$KALI_BOOT/overlays/$ov"
-        else
-            install -m644 "$SCRIPT_DIR/vendored/$ov" "$KALI_BOOT/overlays/$ov"
-        fi
-    done
+    # main tracks hardware rev v5 (the Kickstarter production board); the
+    # earlier prototype (rev v2-ish, unversioned "cardputerzero-overlay")
+    # lives permanently on the PrototypeV2 branch, which keeps the old
+    # num-cs 3->2 GPIO22/CS2 patch below for reference.
+    #
+    # v5's own overlay restructured CS2 entirely: instead of a bare 3rd
+    # SPI0 chip-select claiming GPIO22 directly (the thing that collided
+    # with the LoRa SX1262 cap's BUSY line on v2), CS2 now routes through
+    # a `gpio-forwarder` pseudo-GPIO node wrapping GPIO22. That may already
+    # sidestep the same conflict, or may not — UNVERIFIED, no LoRa cap has
+    # been tested against v5 hardware yet. The old sed-based patch doesn't
+    # apply here (different structure, different offsets) and guessing at
+    # a new one without hardware to verify against is worse than passing
+    # the overlay through untouched. Re-test with the LoRa cap on v5 and
+    # patch properly (or confirm M5 already fixed it) before relying on this.
+    local cz_ovl="$CZ_BOOT/overlays/cardputerzero-v5-overlay.dtbo"
+    [[ -f "$cz_ovl" ]] || err "donor missing cardputerzero-v5-overlay.dtbo (wrong donor for main/v5?)"
+    install -m644 "$cz_ovl" "$KALI_BOOT/overlays/cardputerzero-v5-overlay.dtbo"
+    warn "GPIO22/CS2 LoRa-cap conflict status on v5 is UNVERIFIED — see comment above"
+
+    # bmi270_bmm150_overlay: v5's IMU (BMI270) + magnetometer (BMM150) combo,
+    # split out of cardputerzero-v5-overlay.dtbo into its own overlay (the old
+    # board's overlay embedded a bare bmi270 node directly — no magnetometer).
+    # Donor-only, no vendored fallback: this is v5-specific, not something we
+    # maintain independently. Note the magnetometer currently probes with no
+    # regulator/mounting-matrix supplied (dummy regulator, identity matrix per
+    # factory dmesg) — compass heading will be unreliable until that DT gap is
+    # filled in, upstream or here. (`install` not `cp -a` — exfat→FAT32
+    # ownership preservation silently fails with cp -a.)
+    #
+    # No bq27220_v5 overlay: same as the old bq27220 — the chip has no in-tree
+    # Linux driver, and the out-of-tree binary M5 ships against it isn't
+    # useful (data flash is uncalibrated, on-chip SOC is wrong regardless).
+    # APPLaunch talks to the chip directly via /dev/i2c-1 — see stage_configs
+    # for the i2c-dev autoload.
+    local bmi_ovl="$CZ_BOOT/overlays/bmi270_bmm150_overlay.dtbo"
+    [[ -f "$bmi_ovl" ]] || err "donor missing bmi270_bmm150_overlay.dtbo (wrong donor for main/v5?)"
+    install -m644 "$bmi_ovl" "$KALI_BOOT/overlays/bmi270_bmm150_overlay.dtbo"
 
     write_config_txt
     write_cmdline_txt
@@ -374,20 +363,22 @@ dtoverlay=dwc2,dr_mode=host
 [all]
 enable_uart=1
 
-# Cardputer Zero carrier-board overlays
-dtoverlay=cardputerzero-overlay
-dtoverlay=lsm6ds3tr-overlay
+# Cardputer Zero carrier-board overlays (hardware rev v5 — the Kickstarter
+# production board this branch targets; PrototypeV2 branch has the v2 set).
+dtoverlay=cardputerzero-v5-overlay
+dtoverlay=bmi270_bmm150_overlay
 
-# Power-enable the IMX219 camera sensor (GPIO16 HIGH) and the speaker amp
-# (GPIO24 HIGH) at DT-init time. M5 added these to their May 2025 image; the
-# camera one is the suspected fix for the sensor not ACKing i2c probes on
-# earlier builds (which we and other beta testers reported as a "dead camera").
-dtoverlay=camera-gpio16-high-overlay
-dtoverlay=spk-gpio24-high-overlay
+# No camera-gpio16-high / spk-gpio24-high overlays here: v5's donor config.txt
+# doesn't load them either (confirmed against factory config.txt) — camera and
+# speaker power sequencing moved elsewhere on this board rev. Camera confirmed
+# working live on v5 hardware without them.
 
-# IR receiver + transmitter (per CZ stock config)
+# IR receiver + transmitter. RX unchanged from v2 (gpio-ir was already present
+# in the v2 devicetree pre-populated, just unused until v5 hardware). TX moved
+# from PWM-carrier (pwm-ir-tx) to a software bit-banged carrier (gpio-ir-tx) —
+# same pin, simpler driver, both confirmed probing in factory dmesg.
 dtoverlay=gpio-ir,gpio_pin=13,gpio_pull=up
-dtoverlay=pwm-ir-tx,gpio_pin=12,func=4
+dtoverlay=gpio-ir-tx,gpio_pin=12
 
 # USB OTG (gadget mode) — for later Pi-Tail USB-Ethernet
 dtoverlay=dwc2
@@ -855,7 +846,7 @@ EOF
 
     # Audio routing. Two ALSA cards register at boot — card 0 is vc4hdmi
     # (CZ has no physical HDMI sink, opens fail with ENOSTR), card 1 is the
-    # ES8389 codec driven by es8389_m5stack.ko + the cardputerzero-overlay's
+    # ES8389 codec driven by es8389_m5stack.ko + the cardputerzero-v5-overlay's
     # I2S wiring. ALSA's stock `default` device tries to resolve via
     # cards.pcm.front (per-codec conf files in /usr/share/alsa/cards/) which
     # doesn't exist for the M5-custom codec — so every ALSA app fails with
@@ -1780,10 +1771,8 @@ stage_verify() {
     # Boot files (no u-boot.bin — we boot kernel8.img directly via the GPU loader,
     # matching the OEM image.)
     for f in kernel8.img bcm2710-rpi-cm0.dtb \
-             overlays/cardputerzero-overlay.dtbo \
-             overlays/lsm6ds3tr-overlay.dtbo \
-             overlays/camera-gpio16-high-overlay.dtbo \
-             overlays/spk-gpio24-high-overlay.dtbo; do
+             overlays/cardputerzero-v5-overlay.dtbo \
+             overlays/bmi270_bmm150_overlay.dtbo; do
         [[ -f "$KALI_BOOT/$f" ]] || vfail "missing boot file: $f"
     done
 
@@ -1808,28 +1797,21 @@ stage_verify() {
     fi
 
     # Configs reference our overlays
-    grep -q '^dtoverlay=cardputerzero-overlay' "$KALI_BOOT/config.txt" || vfail "cardputerzero-overlay not in config.txt"
+    grep -q '^dtoverlay=cardputerzero-v5-overlay' "$KALI_BOOT/config.txt" || vfail "cardputerzero-v5-overlay not in config.txt"
+    grep -q '^dtoverlay=bmi270_bmm150_overlay'    "$KALI_BOOT/config.txt" || vfail "bmi270_bmm150_overlay not in config.txt"
     ! grep -q '^kernel=u-boot.bin'             "$KALI_BOOT/config.txt" || vfail "stale kernel=u-boot.bin in config.txt (should boot kernel8.img directly)"
     grep -q 'root=PARTUUID='                   "$KALI_BOOT/cmdline.txt" || vfail "cmdline.txt has no root=PARTUUID"
 
-    # Confirm we installed our patched cardputerzero-overlay (num-cs=2) and
-    # not the donor's stock one (num-cs=3) that collides with the LoRa cap's
-    # BUSY signal on GPIO22. dtc isn't always available in the build host so
-    # we compare against the known size of our vendored fix (6790 bytes).
-    if command -v dtc >/dev/null 2>&1; then
-        dtc -I dtb -O dts "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo" 2>/dev/null \
-            | grep -q 'num-cs = <0x02>' \
-            || vfail "installed cardputerzero-overlay still has num-cs != 2 (GPIO22 collides with LoRa cap)"
-    else
-        local cz_ovl_sz; cz_ovl_sz=$(stat -c %s "$KALI_BOOT/overlays/cardputerzero-overlay.dtbo" 2>/dev/null || echo 0)
-        [[ "$cz_ovl_sz" -eq 6790 ]] \
-            || vfail "cardputerzero-overlay.dtbo size $cz_ovl_sz != expected 6790 (likely stock M5 with the GPIO22 CS2 conflict)"
-    fi
+    # GPIO22/CS2-vs-LoRa-cap status is UNVERIFIED on v5 (see stage_boot comment
+    # above cz_ovl) — no automated check here on purpose. Don't add a num-cs
+    # assertion back in until it's been confirmed against real v5 + LoRa-cap
+    # hardware; a stale assumption baked into verify is worse than no check.
 
     # bq27220: must NOT have an overlay, driver, or any sysfs binding. The chip
     # has no in-tree Linux driver; APPLaunch reads it directly via /dev/i2c-1.
+    # (bq27220 prefix-matches both the old unversioned overlay and v5's bq27220_v5.)
     ! grep -q '^dtoverlay=bq27220'        "$KALI_BOOT/config.txt"                                    || vfail "stale dtoverlay=bq27220 in config.txt (no in-tree driver — remove it)"
-    [[ ! -f "$KALI_BOOT/overlays/bq27220.dtbo" ]]                                                    || vfail "stale bq27220.dtbo in /boot/overlays (no in-tree driver — remove it)"
+    [[ ! -f "$KALI_BOOT/overlays/bq27220.dtbo" && ! -f "$KALI_BOOT/overlays/bq27220_v5.dtbo" ]]      || vfail "stale bq27220*.dtbo in /boot/overlays (no in-tree driver — remove it)"
     [[ ! -f "$KALI_ROOT/usr/lib/modules/$kver/kernel/drivers/power/supply/bq27xxx_battery.ko" ]] \
         || vfail "stale bq27xxx_battery.ko in rootfs (out-of-tree binary, no GPL source — remove it)"
 
