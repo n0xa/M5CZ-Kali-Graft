@@ -313,15 +313,30 @@ stage_boot() {
     # factory dmesg) — compass heading will be unreliable until that DT gap is
     # filled in, upstream or here. (`install` not `cp -a` — exfat→FAT32
     # ownership preservation silently fails with cp -a.)
-    #
-    # No bq27220_v5 overlay: same as the old bq27220 — the chip has no in-tree
-    # Linux driver, and the out-of-tree binary M5 ships against it isn't
-    # useful (data flash is uncalibrated, on-chip SOC is wrong regardless).
-    # APPLaunch talks to the chip directly via /dev/i2c-1 — see stage_configs
-    # for the i2c-dev autoload.
     local bmi_ovl="$CZ_BOOT/overlays/bmi270_bmm150_overlay.dtbo"
     [[ -f "$bmi_ovl" ]] || err "donor missing bmi270_bmm150_overlay.dtbo (wrong donor for main/v5?)"
     install -m644 "$bmi_ovl" "$KALI_BOOT/overlays/bmi270_bmm150_overlay.dtbo"
+
+    # bq27220_v5_overlay: WAS deliberately omitted (see git history / the
+    # PrototypeV2 branch) because the v2 prototype's off-the-shelf battery +
+    # uncalibrated bq27220 made the chip's own gas-gauge readings meaningless
+    # regardless of driver correctness, so APPLaunch's battery UI was left
+    # showing "--" on purpose rather than a wrong number. That reasoning
+    # doesn't hold on v5: this overlay carries real compatible = "ti,bq27220"
+    # (the correct chip-specific binding — the in-tree driver's generic
+    # default silently mis-binds as bq27500, wrong register map, which is
+    # what the old comment here was actually warning about) plus real
+    # ti,design-capacity/-energy/-voltage values matching the donor's own
+    # factory dmesg. Confirmed live on v5: /sys/class/power_supply/bq27220-0
+    # reports self-consistent values (4.2V/96%/Charging while on USB power),
+    # and APPLaunch's actual battery-read path (cp0_lvgl_bq27220.cpp) only
+    # ever reads via that sysfs power_supply node — it does NOT read
+    # /dev/i2c-1 directly for regular status (only for its separate
+    # Calibrate command) despite what an earlier version of this comment
+    # claimed.
+    local bq_ovl="$CZ_BOOT/overlays/bq27220_v5.dtbo"
+    [[ -f "$bq_ovl" ]] || err "donor missing bq27220_v5.dtbo (wrong donor for main/v5?)"
+    install -m644 "$bq_ovl" "$KALI_BOOT/overlays/bq27220_v5.dtbo"
 
     write_config_txt
     write_cmdline_txt
@@ -367,6 +382,7 @@ enable_uart=1
 # production board this branch targets; PrototypeV2 branch has the v2 set).
 dtoverlay=cardputerzero-v5-overlay
 dtoverlay=bmi270_bmm150_overlay
+dtoverlay=bq27220_v5
 
 # No camera-gpio16-high / spk-gpio24-high overlays here: v5's donor config.txt
 # doesn't load them either (confirmed against factory config.txt) — camera and
@@ -449,16 +465,15 @@ stage_rootfs() {
         ok "Copied $(du -sh "$mod_dst" | cut -f1) of modules"
         rebuild_depmod=1
 
-        # M5's 2025-05+ image ships bq27xxx_battery*.ko in BOTH /extra/ (their
-        # out-of-tree builds, incl. _hdq variant) AND /kernel/drivers/power/supply/
-        # (in-tree variants enabled via CONFIG_BATTERY_BQ27XXX=y). We don't want
-        # any of them: the chip's data flash is uncalibrated, the kernel driver
-        # binds it as bq27500 (wrong register map), and APPLaunch already reads
-        # it correctly via /dev/i2c-1 with a voltage-derived SOC. Strip both
-        # locations before depmod so they aren't loaded at boot. See README's
-        # "no kernel driver for bq27220" entry for context.
-        rm -f "$mod_dst/extra/bq27xxx_battery"*.ko \
-              "$mod_dst/kernel/drivers/power/supply/bq27xxx_battery"*.ko
+        # bq27xxx_battery*.ko: kept, NOT stripped, on v5. Earlier (v2-prototype)
+        # graft builds deliberately deleted these — that prototype's battery was
+        # an off-the-shelf cell paired with an uncalibrated bq27220, so the
+        # chip's own gas-gauge readings were wildly wrong regardless of kernel
+        # driver correctness. v5 is close to the November retail hardware and
+        # its bq27220 is properly calibrated: with bq27220_v5.dtbo bound (see
+        # write_config_txt), /sys/class/power_supply/bq27220-0 reports sane,
+        # self-consistent values (confirmed live: 4.2V/96%/Charging while on
+        # USB power). PrototypeV2 branch keeps the old strip-it-out behavior.
     fi
 
     if (( rebuild_depmod )); then
@@ -539,6 +554,20 @@ stage_rootfs() {
             cp -af "$CZ_ROOT/lib/firmware/cypress/$f" "$KALI_ROOT/usr/lib/firmware/cypress/"
         fi
     done
+
+    # ST7789V panel init-sequence firmware. v5 moved the LCD from a bespoke
+    # fbtft driver to the mainline panel-mipi-dbi framework, which doesn't
+    # hardcode per-panel init sequences — it request_firmware()s a small blob
+    # (93 bytes: register-init sequence, not a big binary) matching the DT
+    # node's compatible string. Without it panel-mipi-dbi-spi's probe fails
+    # outright with -ENOENT ("No config file found") and the ST7789 backlight
+    # comes on with nothing ever rendered — confirmed live on real v5 hardware.
+    local panel_fw="cardputerzero,st7789v_lcd.bin"
+    if [[ -f "$CZ_ROOT/lib/firmware/$panel_fw" ]]; then
+        install -m644 "$CZ_ROOT/lib/firmware/$panel_fw" "$KALI_ROOT/usr/lib/firmware/$panel_fw"
+    else
+        warn "Donor missing $panel_fw — ST7789 panel will not display anything"
+    fi
 
     # Symlink the missing CM0 .clm_blob → generic cypress blob
     local clm="$KALI_ROOT/usr/lib/firmware/brcm/brcmfmac43430-sdio.raspberrypi,0-compute-module.clm_blob"
@@ -659,7 +688,7 @@ stage_applaunch() {
     install_zeroclaw "$KALI_ROOT/home/pi"
 
     if [[ -x "$KALI_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch" \
-       && -L "$KALI_ROOT/etc/systemd/system/multi-user.target.wants/APPLaunch.service" ]]; then
+       && -L "$KALI_ROOT/etc/systemd/user/default.target.wants/APPLaunch.service" ]]; then
         ok "APPLaunch already installed + enabled — skipping (rm /usr/share/APPLaunch to force)"
         return
     fi
@@ -692,24 +721,68 @@ stage_applaunch() {
     rm -rf "$KALI_ROOT/usr/share/APPLaunch/cache"
     ln -s /var/cache/APPLaunch "$KALI_ROOT/usr/share/APPLaunch/cache"
 
-    # systemctl enable equivalent
-    mkdir -p "$KALI_ROOT/etc/systemd/system/multi-user.target.wants"
-    ln -sf /lib/systemd/system/APPLaunch.service \
-        "$KALI_ROOT/etc/systemd/system/multi-user.target.wants/APPLaunch.service"
+    # systemctl --user enable equivalent. The .deb ships this as a USER unit
+    # (usr/lib/systemd/user/APPLaunch.service, WantedBy=default.target) — it's
+    # meant to run in the logged-in user's session, not as a system daemon.
+    # Confirmed live: symlinking it into multi-user.target.wants/ (the SYSTEM
+    # enable path) creates a dangling symlink to a system-tree path the .deb
+    # never populates, so APPLaunch silently never started on any graft build
+    # before this fix. /etc/systemd/user/default.target.wants/ is the global
+    # (all-users) equivalent of `systemctl --user enable` — matches the
+    # "vendor preset: enabled" state `systemctl --user list-unit-files`
+    # reports for this unit, i.e. what a real `dpkg -i` postinst would do.
+    mkdir -p "$KALI_ROOT/etc/systemd/user/default.target.wants"
+    ln -sf /usr/lib/systemd/user/APPLaunch.service \
+        "$KALI_ROOT/etc/systemd/user/default.target.wants/APPLaunch.service"
 
     # Drop-in: wait for udev to populate /dev/input/by-path symlinks before
     # APPLaunch starts. Without this, APPLaunch races udev — opens the keypad
     # via the missing by-path symlink, libinput returns ENOENT, and the
-    # keypad is silently lost for the whole session.
-    mkdir -p "$KALI_ROOT/etc/systemd/system/APPLaunch.service.d"
-    cat > "$KALI_ROOT/etc/systemd/system/APPLaunch.service.d/wait-for-udev.conf" <<'EOF'
+    # keypad is silently lost for the whole session. Drop-ins for a user unit
+    # live under /etc/systemd/user/, same mechanics as the system tree.
+    mkdir -p "$KALI_ROOT/etc/systemd/user/APPLaunch.service.d"
+    cat > "$KALI_ROOT/etc/systemd/user/APPLaunch.service.d/wait-for-udev.conf" <<'EOF'
 [Unit]
-After=systemd-udev-settle.service multi-user.target
-Wants=systemd-udev-settle.service
+After=systemd-udev-settle.service
 
 [Service]
 ExecStartPre=/bin/sh -c "for i in 1 2 3 4 5 6 7 8 9 10; do [ -e /dev/input/by-path/platform-3f804000.i2c-event ] && exit 0; sleep 1; done; exit 0"
 EOF
+
+    # panel_mipi_dbi_m doesn't reliably auto-load via the normal OF/modalias
+    # coldplug path the way every other CZ driver on this board does (m5ioe1,
+    # tca8418, gpio_forwarder all bind automatically; this one consistently
+    # didn't across repeated cold boots in testing, cause not fully root-
+    # caused). Force it explicitly rather than depend on a coldplug event that
+    # doesn't reliably fire — APPLaunch needs /dev/fb_lcd to exist at startup.
+    mkdir -p "$KALI_ROOT/etc/modules-load.d"
+    echo "panel_mipi_dbi_m" > "$KALI_ROOT/etc/modules-load.d/cardputerzero-panel.conf"
+
+    # Udev rules pairing the internal SPI panel + I2C keypad onto their own
+    # dedicated logind seat ("seat-cardputer-zero"), and creating the stable
+    # /dev/fb_lcd symlink APPLaunch actually opens (fb0 vs fb1 depends on
+    # probe order — vc4-hdmi usually wins fb0 whenever it's present, which the
+    # OEM image mostly avoids by not also running a full desktop on HDMI).
+    # This is a two-file PAIR, not one rule: 99-cardputer-zero-lcd.rules tags
+    # the panel's DRM device master-of-seat (so logind would arbitrate DRM
+    # master via a session on that seat), and zz-cardputerzero-hdmi-display.rules
+    # (sorted to run after, in /usr/lib not /etc — same as the donor) strips
+    # that tag back off, because nothing ever creates a logind session on
+    # seat-cardputer-zero. Confirmed live: with master-of-seat still tagged,
+    # even root gets EACCES trying to modeset the panel ("Permission denied");
+    # APPLaunch is meant to own the device directly, unmanaged by logind.
+    # Copying only the first file (which is what an earlier version of this
+    # function did) reproduces exactly that failure.
+    for f in etc/udev/rules.d/99-cardputer-zero-lcd.rules \
+             etc/udev/rules.d/99-cardputer-zero-keyboard.rules \
+             etc/udev/rules.d/99-ignore-i2c-key.rules \
+             usr/lib/udev/rules.d/zz-cardputerzero-hdmi-display.rules; do
+        if [[ -f "$CZ_ROOT/$f" ]]; then
+            install -D -m644 "$CZ_ROOT/$f" "$KALI_ROOT/$f"
+        else
+            warn "Donor missing $f — internal panel/keypad seat routing will be wrong"
+        fi
+    done
 
     ok "APPLaunch installed + service enabled"
 }
@@ -799,12 +872,11 @@ Section "Device"
 EndSection
 EOF
 
-    # Expose i2c-1 to userspace. The bq27220 fuel gauge has no in-tree Linux
-    # driver, so we don't bind a kernel driver to it at all — APPLaunch reads
-    # the chip directly via /dev/i2c-1 with the correct bq27220 register map
-    # (see projects/APPLaunch/main/hal/linux/hal_settings_linux.cpp). Without
-    # this, /dev/i2c-1 is missing at boot and APPLaunch falls through to no
-    # battery info at all.
+    # Expose i2c-1 to userspace. The bq27220 kernel driver (bq27220_v5.dtbo,
+    # see stage_boot) handles normal battery status via /sys/class/power_supply
+    # now — this is for APPLaunch's separate Calibrate command
+    # (cp0_lvgl_bq27220.cpp Bq27220System::calibrate()), which talks to the
+    # chip directly via raw I2C_RDWR ioctls on /dev/i2c-1 regardless.
     mkdir -p "$KALI_ROOT/etc/modules-load.d"
     cat > "$KALI_ROOT/etc/modules-load.d/i2c-dev.conf" <<'EOF'
 i2c-dev
@@ -1807,17 +1879,33 @@ stage_verify() {
     # assertion back in until it's been confirmed against real v5 + LoRa-cap
     # hardware; a stale assumption baked into verify is worse than no check.
 
-    # bq27220: must NOT have an overlay, driver, or any sysfs binding. The chip
-    # has no in-tree Linux driver; APPLaunch reads it directly via /dev/i2c-1.
-    # (bq27220 prefix-matches both the old unversioned overlay and v5's bq27220_v5.)
-    ! grep -q '^dtoverlay=bq27220'        "$KALI_BOOT/config.txt"                                    || vfail "stale dtoverlay=bq27220 in config.txt (no in-tree driver — remove it)"
-    [[ ! -f "$KALI_BOOT/overlays/bq27220.dtbo" && ! -f "$KALI_BOOT/overlays/bq27220_v5.dtbo" ]]      || vfail "stale bq27220*.dtbo in /boot/overlays (no in-tree driver — remove it)"
-    [[ ! -f "$KALI_ROOT/usr/lib/modules/$kver/kernel/drivers/power/supply/bq27xxx_battery.ko" ]] \
-        || vfail "stale bq27xxx_battery.ko in rootfs (out-of-tree binary, no GPL source — remove it)"
+    # bq27220: SHOULD have the v5 overlay + driver present (see stage_boot for
+    # why this reverses the old v2-era "strip it out" policy — v2's uncalibrated
+    # battery made readings meaningless, v5's chip gives sane values).
+    grep -q '^dtoverlay=bq27220_v5'  "$KALI_BOOT/config.txt"        || vfail "bq27220_v5 not in config.txt"
+    [[ -f "$KALI_BOOT/overlays/bq27220_v5.dtbo" ]]                  || vfail "bq27220_v5.dtbo missing from /boot/overlays"
+    [[ -f "$KALI_ROOT/usr/lib/modules/$kver/extra/bq27xxx_battery.ko" \
+       && -f "$KALI_ROOT/usr/lib/modules/$kver/extra/bq27xxx_battery_i2c.ko" ]] \
+        || vfail "bq27xxx_battery*.ko missing from rootfs (battery UI will show \"--\")"
 
-    # /dev/i2c-1 autoload (APPLaunch's bq27220 reader needs it)
+    # /dev/i2c-1 autoload (APPLaunch's Calibrate command needs it — see stage_configs)
     grep -qx 'i2c-dev' "$KALI_ROOT/etc/modules-load.d/i2c-dev.conf" 2>/dev/null \
-        || vfail "i2c-dev not in /etc/modules-load.d/i2c-dev.conf (APPLaunch will see no battery)"
+        || vfail "i2c-dev not in /etc/modules-load.d/i2c-dev.conf (APPLaunch battery calibration will fail)"
+
+    # ST7789 panel firmware + autoload (see stage_rootfs / stage_applaunch)
+    [[ -f "$KALI_ROOT/usr/lib/firmware/cardputerzero,st7789v_lcd.bin" ]] \
+        || vfail "panel firmware missing (ST7789 backlight comes on, nothing renders)"
+    grep -qx 'panel_mipi_dbi_m' "$KALI_ROOT/etc/modules-load.d/cardputerzero-panel.conf" 2>/dev/null \
+        || vfail "panel_mipi_dbi_m not forced via modules-load.d (doesn't reliably coldplug-autoload)"
+
+    # Panel/keypad seat-routing udev rules (see stage_applaunch for why this is
+    # a two-file pair, not one rule)
+    for f in etc/udev/rules.d/99-cardputer-zero-lcd.rules \
+             etc/udev/rules.d/99-cardputer-zero-keyboard.rules \
+             etc/udev/rules.d/99-ignore-i2c-key.rules \
+             usr/lib/udev/rules.d/zz-cardputerzero-hdmi-display.rules; do
+        [[ -f "$KALI_ROOT/$f" ]] || vfail "missing $f (panel/keypad seat routing will be wrong)"
+    done
 
     # rtw88 blacklist must be present so 88XXau wins over in-tree rtw88_8821au
     grep -q 'blacklist rtw88_8821au' "$KALI_ROOT/etc/modprobe.d/rtw88-dkms-override.conf" 2>/dev/null \
@@ -1919,9 +2007,11 @@ stage_verify() {
     # APPLaunch
     [[ -x "$KALI_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch" ]] \
         || vfail "APPLaunch binary missing"
-    [[ -L "$KALI_ROOT/etc/systemd/system/multi-user.target.wants/APPLaunch.service" ]] \
-        || vfail "APPLaunch.service not enabled (no symlink in multi-user.target.wants)"
-    [[ -f "$KALI_ROOT/etc/systemd/system/APPLaunch.service.d/wait-for-udev.conf" ]] \
+    # APPLaunch.service is a USER unit (see stage_applaunch) — checked under
+    # etc/systemd/user/, not the system tree.
+    [[ -L "$KALI_ROOT/etc/systemd/user/default.target.wants/APPLaunch.service" ]] \
+        || vfail "APPLaunch.service not enabled (no symlink in etc/systemd/user/default.target.wants)"
+    [[ -f "$KALI_ROOT/etc/systemd/user/APPLaunch.service.d/wait-for-udev.conf" ]] \
         || vfail "APPLaunch udev-wait drop-in missing (keypad will race udev and silently fail to grab)"
 
     # CM0 WiFi firmware (the missing .clm_blob landmine)
