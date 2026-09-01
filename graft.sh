@@ -338,6 +338,18 @@ stage_boot() {
     [[ -f "$bq_ovl" ]] || err "donor missing bq27220_v5.dtbo (wrong donor for main/v5?)"
     install -m644 "$bq_ovl" "$KALI_BOOT/overlays/bq27220_v5.dtbo"
 
+    # Boot splash image for fb_load (see stage_rootfs for the binary/service).
+    # 170x320, 16bpp RGB565 BMP — exact native match for the ST7789 panel's
+    # resolution and the panel-mipi-dbi node's format="r5g6b5", so fb_load can
+    # blit it straight to /dev/fb_lcd with no decode/scale step. Stock M5 logo
+    # for now; swap this file for a custom splash whenever wanted.
+    local splash="$CZ_BOOT/splash.bmp"
+    if [[ -f "$splash" ]]; then
+        install -m644 "$splash" "$KALI_BOOT/splash.bmp"
+    else
+        warn "Donor missing splash.bmp — boot splash will not display"
+    fi
+
     write_config_txt
     write_cmdline_txt
     write_user_data
@@ -569,6 +581,25 @@ stage_rootfs() {
         warn "Donor missing $panel_fw — ST7789 panel will not display anything"
     fi
 
+    # fb_load: instant boot-splash binary + its sysinit.target unit. Runs as
+    # early as udev can create /dev/fb_lcd (DefaultDependencies=no, Before=
+    # plymouth-start.service), blits splash.bmp (see stage_boot) straight to
+    # it, and holds the fb open (--keep-open) until it detects APPLaunch is
+    # running, then paints once more and exits — seamless handoff, no black-
+    # screen gap. Only depends on libc.so.6 (verified via readelf -d), so it
+    # runs on Kali's libc unmodified — no extra libs to lift.
+    local fb_load_bin="$CZ_ROOT/usr/sbin/fb_load"
+    local fb_load_unit="$CZ_ROOT/etc/systemd/system/fb_load.service"
+    if [[ -f "$fb_load_bin" && -f "$fb_load_unit" ]]; then
+        install -m755 "$fb_load_bin" "$KALI_ROOT/usr/sbin/fb_load"
+        install -m644 "$fb_load_unit" "$KALI_ROOT/etc/systemd/system/fb_load.service"
+        mkdir -p "$KALI_ROOT/etc/systemd/system/sysinit.target.wants"
+        ln -sf /etc/systemd/system/fb_load.service \
+            "$KALI_ROOT/etc/systemd/system/sysinit.target.wants/fb_load.service"
+    else
+        warn "Donor missing fb_load binary/unit — no instant boot splash"
+    fi
+
     # Symlink the missing CM0 .clm_blob → generic cypress blob
     local clm="$KALI_ROOT/usr/lib/firmware/brcm/brcmfmac43430-sdio.raspberrypi,0-compute-module.clm_blob"
     if [[ ! -e "$clm" ]]; then
@@ -783,6 +814,28 @@ EOF
             warn "Donor missing $f — internal panel/keypad seat routing will be wrong"
         fi
     done
+
+    # ExtPort (CAP/Grove 5V) LED-class GPIO permissions. grove_fun,
+    # ext_usb_gpio_fun, ext_5v_out, grove_5v_out are m5ioe1-backed gpio-leds
+    # (see the v5 overlay's `leds` node) — real, working GPIOs confirmed live
+    # on factory OS via /sys/kernel/debug/gpio. But their brightness sysfs
+    # files default to root-only-writable, and APPLaunch runs unprivileged.
+    # Without these two files (donor-shipped, never copied before) + a `gpio`
+    # group for the kali user to be in, APPLaunch's ExtPort toggle in
+    # Settings silently fails every write — UI shows the state it tried to
+    # set, GPIO stays at its power-on default, completely disconnected.
+    # Confirmed root cause live: factory OS has both files + kali-equivalent
+    # (pi) user in `gpio`; our graft had neither.
+    for f in usr/lib/udev/rules.d/60-cardputerzero-leds.rules \
+             usr/lib/tmpfiles.d/cardputerzero-leds.conf; do
+        if [[ -f "$CZ_ROOT/$f" ]]; then
+            install -D -m644 "$CZ_ROOT/$f" "$KALI_ROOT/$f"
+        else
+            warn "Donor missing $f — ExtPort/Grove 5V toggle in APPLaunch will silently do nothing"
+        fi
+    done
+    grep -q '^gpio:' "$KALI_ROOT/etc/group" || groupadd --root "$KALI_ROOT" --system gpio
+    usermod --root "$KALI_ROOT" -aG gpio kali
 
     ok "APPLaunch installed + service enabled"
 }
@@ -1906,6 +1959,21 @@ stage_verify() {
              usr/lib/udev/rules.d/zz-cardputerzero-hdmi-display.rules; do
         [[ -f "$KALI_ROOT/$f" ]] || vfail "missing $f (panel/keypad seat routing will be wrong)"
     done
+
+    # fb_load instant boot splash (see stage_rootfs / stage_boot)
+    [[ -x "$KALI_ROOT/usr/sbin/fb_load" ]] || vfail "fb_load binary missing"
+    [[ -L "$KALI_ROOT/etc/systemd/system/sysinit.target.wants/fb_load.service" ]] \
+        || vfail "fb_load.service not enabled (no symlink in sysinit.target.wants)"
+    [[ -f "$KALI_BOOT/splash.bmp" ]] || vfail "splash.bmp missing from boot partition (no boot splash)"
+
+    # ExtPort (CAP/Grove 5V) LED-class GPIO permissions (see stage_applaunch)
+    [[ -f "$KALI_ROOT/usr/lib/udev/rules.d/60-cardputerzero-leds.rules" ]] \
+        || vfail "60-cardputerzero-leds.rules missing (ExtPort toggle in APPLaunch will silently do nothing)"
+    [[ -f "$KALI_ROOT/usr/lib/tmpfiles.d/cardputerzero-leds.conf" ]] \
+        || vfail "cardputerzero-leds.conf missing (ExtPort toggle in APPLaunch will silently do nothing)"
+    grep -q '^gpio:' "$KALI_ROOT/etc/group" || vfail "gpio group missing"
+    grep '^gpio:' "$KALI_ROOT/etc/group" | grep -q '\bkali\b' \
+        || vfail "kali user not in gpio group (ExtPort toggle needs write access to LED brightness files)"
 
     # rtw88 blacklist must be present so 88XXau wins over in-tree rtw88_8821au
     grep -q 'blacklist rtw88_8821au' "$KALI_ROOT/etc/modprobe.d/rtw88-dkms-override.conf" 2>/dev/null \
