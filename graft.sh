@@ -68,6 +68,45 @@ ZEROCLAW_URL="${ZEROCLAW_URL:-https://github.com/zeroclaw-labs/zeroclaw/releases
 ZEROCLAW_SHA256="${ZEROCLAW_SHA256:-0b1197f1d80243e5c748b63a550cc6dfc37e407c4d15f729b32324ba9fe4c2ac}"
 ZEROCLAW_CACHE="${ZEROCLAW_CACHE:-$SCRIPT_DIR/cache/$ZEROCLAW_TGZ_NAME}"
 
+# "Bonus" APPLaunch apps — Camera, Music, Piano, Compass, IR-Chat, IR-Remote,
+# and both Cap-CC1101 apps. All ship in the donor's full OS image but are
+# absent from the standalone applaunch_*.deb release stage_applaunch installs
+# (confirmed by inspecting that .deb's payload: it only carries LaunchWizard/
+# APPLaunch/AppStore/Calculator/ZClaw — M5's pi-gen build bakes everything
+# else in separately). Each has its own versioned .deb release on its own
+# GitHub repo; stage_extra_apps installs them via a real `apt install` (not
+# the manual ar/tar extraction stage_applaunch uses for the main .deb), so
+# postinst/dpkg registration work correctly — same lesson as the APPLaunch
+# systemd-unit bug earlier in this file.
+#
+# Format per line: slug|url|sha256. Pin + bump deliberately, same as ZEROCLAW.
+EXTRA_APPS_MANIFEST="
+camera|https://github.com/CardputerZero/Camera/releases/download/v0.3.7/Camera_0.3.7_m5stack1_arm64.deb|93eb99a39b0b0994d2dfc157e29f3157345ba8e0c646eb0e545f4480334c30ea
+music|https://github.com/CardputerZero/Music/releases/download/v0.1.5/m5cardputerzero-music_0.1.5_m5stack1_arm64.deb|a19bdb7333e3c831b9cc3bc6fe2f339734152af8f24c8bca7228ae364b17b9c6
+piano|https://github.com/CardputerZero/Piano/releases/download/v0.1.1/m5cardputerzero-piano_0.1.1_m5stack1_arm64.deb|d91dbc7b89a19e8c0c7452034a104cd54e6e28ebc9671f26c8a8a7b7b54599b2
+compass|https://github.com/CardputerZero/Compass/releases/download/v0.2.4/m5cardputerzero-compass_0.2.4_m5stack1_arm64.deb|caa8f2135eeaca45c1d7efe1ca2abb1a96d7cec894d995b630d5aaef65734be6
+ir-chat|https://github.com/CardputerZero/IR-Chat/releases/download/v0.1.2/m5cardputerzero-ir-chat_0.1.2_m5stack1_arm64.deb|72fa4d1f732f68d4b11a6f01fa7553dc70eafc7242da908fea001c03260b5a95
+ir-remote|https://github.com/CardputerZero/IR-Remote/releases/download/v0.1.3/m5cardputerzero-ir-remote_0.1.3_m5stack1_arm64.deb|d6c29677680208c4876b6bb47da7b4cbafca14b30a08a08def4754034b0479e4
+cap-cc1101-nfc|https://github.com/CardputerZero/Cap-CC1101-NFC/releases/download/v0.1.3/m5cardputerzero-cap-cc1101-nfc_0.1.3_m5stack1_arm64.deb|46e97bbdb5a6983d28ec4fc328b4688d99d290eaeb8c8a19cfe40ab0252a73ca
+cap-cc1101-subg-chat|https://github.com/CardputerZero/Cap-CC1101-SubG-Chat/releases/download/v0.1.8/m5cardputerzero-cap-cc1101-subg-chat_0.1.8_m5stack1_arm64.deb|0af609132c842c438e21d69783c6878a2fdd9f1d5d05051c8526b2d6b9f7e174
+"
+
+# Prerequisites for the Cap-CC1101 pair only: neither raspi-utils-core/-dt nor
+# their own libgpiolib0/libdtovl0 libs are packaged in Kali's repos at all —
+# verified live (`apt-cache policy` returns nothing, not just "not
+# installed"). Sourced directly from Raspberry Pi's own archive instead of
+# adding a whole foreign apt source, which would risk apt preferring a
+# different libcamera etc. on some future `apt upgrade` (see stage_rootfs's
+# camera-lift comments for why that's dangerous). Both chains verified to
+# terminate in already-present Debian packages only (libc6, libfdt1) — no
+# further surprises down the tree.
+EXTRA_APPS_PREREQS="
+raspi-utils-core|https://archive.raspberrypi.org/debian/pool/main/r/raspi-utils/raspi-utils-core_20260626-1_arm64.deb|3df579a81d76081e283409840beb9b1df26a9487c50aef95293743a4ba689fb9
+raspi-utils-dt|https://archive.raspberrypi.org/debian/pool/main/r/raspi-utils/raspi-utils-dt_20260626-1_arm64.deb|068adfdf78097ca0429da2adac0f35769e217e8db20045c0090536e690b2d606
+libgpiolib0|https://archive.raspberrypi.org/debian/pool/main/r/raspi-utils/libgpiolib0_20260626-1_arm64.deb|594956f65e16d1fcbfd7b76046e11800ff12c0784936ed6fc3b792e707cee8f9
+libdtovl0|https://archive.raspberrypi.org/debian/pool/main/r/raspi-utils/libdtovl0_20260626-1_arm64.deb|4b81f914be83ca68cba2da4d8d4d70bdfe3ee9b3006b7e049e86c46d29968225
+"
+
 CZ_HOSTNAME="${CZ_HOSTNAME:-cardputerzero-kali}"
 GROW_GB="${GROW_GB:-4}"
 
@@ -838,6 +877,98 @@ EOF
     usermod --root "$KALI_ROOT" -aG gpio kali
 
     ok "APPLaunch installed + service enabled"
+}
+
+# ── stage_extra_apps: Camera/Music/Piano/Compass/IR-Chat/IR-Remote/         ──
+# ── Cap-CC1101-NFC/Cap-CC1101-SubG-Chat, via real `apt install` of pinned  ──
+# ── .debs (see EXTRA_APPS_MANIFEST/EXTRA_APPS_PREREQS above for what/why). ──
+#
+# Downloads are cached + checksum-verified under $SCRIPT_DIR/cache/, same
+# convention as ZEROCLAW. Installed inside a qemu-aarch64 chroot (same
+# bind-mount pattern as stage_packages) via real `apt-get install` of the
+# local files — not the hand-rolled ar/tar extraction stage_applaunch uses
+# for the single main .deb, which is exactly what silently dropped the
+# APPLaunch systemd unit earlier in this project's history. A real apt
+# install runs postinst and registers everything in dpkg correctly.
+stage_extra_apps() {
+    log "Installing bonus APPLaunch apps (Camera, Music, Piano, Compass, IR-Chat, IR-Remote, Cap-CC1101 x2)"
+
+    require_cmds qemu-aarch64-static
+
+    if [[ -x "$KALI_ROOT/usr/bin/camera_app" \
+       && -x "$KALI_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-Music" \
+       && -x "$KALI_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-Piano" \
+       && -x "$KALI_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-Compass" \
+       && -x "$KALI_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-IR-Chat" \
+       && -x "$KALI_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-IR-Remote" \
+       && -x "$KALI_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-Cap-CC1101-NFC" \
+       && -x "$KALI_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-Cap-CC1101-SubG-Chat" ]]; then
+        ok "All bonus apps already installed — skipping"
+        return
+    fi
+
+    mkdir -p "$SCRIPT_DIR/cache/extra-apps"
+    local debs=() slug url sha256 cache_path
+    while IFS='|' read -r slug url sha256; do
+        [[ -z "$slug" ]] && continue
+        cache_path="$SCRIPT_DIR/cache/extra-apps/$(basename "$url")"
+        if [[ ! -f "$cache_path" ]] || ! echo "$sha256  $cache_path" | sha256sum -c --status; then
+            log "Fetching $slug: $(basename "$url")"
+            curl -L --fail --progress-bar -o "$cache_path.part" "$url"
+            mv "$cache_path.part" "$cache_path"
+        fi
+        echo "$sha256  $cache_path" | sha256sum -c --status \
+            || err "$slug .deb SHA256 mismatch ($cache_path) — refusing to install"
+        debs+=("$cache_path")
+    done <<< "${EXTRA_APPS_MANIFEST}${EXTRA_APPS_PREREQS}"
+
+    local stage_dir="$KALI_ROOT/root/extra-apps-debs"
+    mkdir -p "$stage_dir"
+    local in_chroot=()
+    for d in "${debs[@]}"; do
+        cp -f "$d" "$stage_dir/"
+        in_chroot+=("/root/extra-apps-debs/$(basename "$d")")
+    done
+
+    CHROOT_RESOLV="$KALI_ROOT/etc/resolv.conf"
+    CHROOT_RESOLV_WAS_SYMLINK=false
+    [[ -L "$CHROOT_RESOLV" ]] && CHROOT_RESOLV_WAS_SYMLINK=true
+    cp -f /etc/resolv.conf "$CHROOT_RESOLV"
+    mount --bind /dev     "$KALI_ROOT/dev"
+    mount --bind /dev/pts "$KALI_ROOT/dev/pts"
+    mount -t proc proc    "$KALI_ROOT/proc"
+    mount -t sysfs sysfs  "$KALI_ROOT/sys"
+
+    extra_apps_cleanup() {
+        umount -l "$KALI_ROOT/sys"     2>/dev/null || true
+        umount -l "$KALI_ROOT/proc"    2>/dev/null || true
+        umount -l "$KALI_ROOT/dev/pts" 2>/dev/null || true
+        umount -l "$KALI_ROOT/dev"     2>/dev/null || true
+        rm -rf "$stage_dir"
+        if [[ "${CHROOT_RESOLV_WAS_SYMLINK:-false}" == "true" ]]; then
+            rm -f "$CHROOT_RESOLV"
+            ln -sf /run/systemd/resolve/stub-resolv.conf "$CHROOT_RESOLV" 2>/dev/null || \
+            ln -sf /etc/resolvconf/run/resolv.conf "$CHROOT_RESOLV" 2>/dev/null || \
+            : > "$CHROOT_RESOLV"
+        elif [[ -f "${CHROOT_RESOLV:-}" ]]; then
+            : > "$CHROOT_RESOLV"
+        fi
+    }
+    trap extra_apps_cleanup RETURN
+
+    # apt-get update defensively rather than assume stage_packages already
+    # warmed the cache in this same run (mirrors stage_launcher_build's own
+    # chroot block, which does the same rather than rely on stage ordering).
+    log "apt install: ${#in_chroot[@]} local .debs (bonus apps + raspi-utils prereqs)"
+    chroot "$KALI_ROOT" /usr/bin/env -i \
+        DEBIAN_FRONTEND=noninteractive HOME=/root \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+        bash -e -c '
+apt-get update -qq
+apt-get install -y "$@"
+' -- "${in_chroot[@]}"
+
+    ok "Bonus apps installed"
 }
 
 stage_configs() {
@@ -2135,6 +2266,29 @@ stage_verify() {
     [[ -x "$KALI_ROOT/home/pi/zeroclaw" ]] \
         || vfail "/home/pi/zeroclaw missing (Claw applet will instantly exit)"
 
+    # Bonus apps (see stage_extra_apps) — Camera ships its own bin/desktop
+    # naming; the rest follow APPLaunch's M5CardputerZero-<Name> convention.
+    [[ -x "$KALI_ROOT/usr/bin/camera_app" ]] \
+        || vfail "camera_app binary missing (stage_extra_apps didn't run or failed)"
+    [[ -f "$KALI_ROOT/usr/share/APPLaunch/applications/camera_app.desktop" ]] \
+        || vfail "camera_app.desktop missing (Camera won't show in APPLaunch)"
+    local app_name app_slug
+    while IFS='|' read -r app_slug app_name; do
+        [[ -z "$app_slug" ]] && continue
+        [[ -x "$KALI_ROOT/usr/share/APPLaunch/bin/M5CardputerZero-$app_name" ]] \
+            || vfail "M5CardputerZero-$app_name binary missing (stage_extra_apps didn't run or failed)"
+        [[ -f "$KALI_ROOT/usr/share/APPLaunch/applications/$app_slug.desktop" ]] \
+            || vfail "$app_slug.desktop missing (${app_name} won't show in APPLaunch)"
+    done <<'EOF'
+music|Music
+piano|Piano
+compass|Compass
+ir-chat|IR-Chat
+ir-remote|IR-Remote
+cap-cc1101-nfc|Cap-CC1101-NFC
+cap-cc1101-subg-chat|Cap-CC1101-SubG-Chat
+EOF
+
     # Apt holds for the load-bearing kernel/bootloader/firmware packages —
     # without these a casual `apt upgrade` will replace kernel8.img, the dtb,
     # or the firmware blobs and the LCD/keypad will silently die on next boot.
@@ -2280,6 +2434,7 @@ Stages (run any subset; default is "all"):
   rootfs    | copy CZ kernel modules + CM0 BCM firmware blobs + Cypress NVRAM (incl. BCM43439 boardflags3 fix)
   applaunch      | install APPLaunch .deb (prefers local build, else donor's bundled one)
   launcher-build | (opt-in, NOT in 'all') build APPLaunch from upstream source + cache .deb. LAUNCHER_REBUILD=1 to force.
+  extra-apps     | apt-install Camera/Music/Piano/Compass/IR-Chat/IR-Remote/Cap-CC1101 x2 (missing from the main .deb)
   configs        | write static configs (glycin env, fbcon disable, X input ignore, lightdm autologin, skel)
   packages       | chroot via qemu-user-static and apt-install LXDE + lightdm-autologin-greeter + zram-tools + feh
   tweaks    | NM managed=true, mask networking.service, /etc/hosts entry
@@ -2331,6 +2486,7 @@ run_stage() {
         rootfs)    stage_check; stage_donor; stage_unxz; stage_resize; stage_mount; stage_rootfs ;;
         applaunch) stage_check; stage_donor; stage_unxz; stage_resize; stage_mount; stage_applaunch ;;
         launcher-build) stage_check; stage_launcher_build ;;
+        extra-apps) stage_check; stage_donor; stage_unxz; stage_resize; stage_mount; stage_extra_apps ;;
         configs)   stage_check; stage_donor; stage_unxz; stage_resize; stage_mount; stage_configs ;;
         packages)  stage_check; stage_donor; stage_unxz; stage_resize; stage_mount; stage_packages ;;
         tweaks)    stage_check; stage_donor; stage_unxz; stage_resize; stage_mount; stage_tweaks ;;
@@ -2349,6 +2505,7 @@ run_stage() {
             stage_applaunch
             stage_configs
             stage_packages
+            stage_extra_apps
             stage_tweaks
             stage_verify
             stage_summary
