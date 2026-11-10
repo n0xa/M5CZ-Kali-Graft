@@ -1,311 +1,270 @@
 # graft.sh — Kali on the M5 Cardputer Zero
 
-`graft.sh` builds a Kali Linux arm64 SD-card image that runs M5Stack's stock
-**APPLaunch** on the device's onboard ST7789V LCD, while keeping HDMI/SSH/Kali
-tools available as the secondary UX. It works by **grafting** the CZ-specific
-bits (M5-patched kernel + modules, carrier-board device-tree overlays,
-WiFi/Bluetooth firmware, APPLaunch itself) onto a vanilla Kali Pi-arm64 image,
-then chroot-installing the desktop stack via `qemu-user-static`.
+`graft.sh` builds a Kali Linux arm64 SD-card image for the M5Stack **Cardputer
+Zero** (hardware rev v5, the production board): M5's **APPLaunch** on the
+onboard ST7789 LCD with the built-in keyboard, an LXDE desktop on **HDMI** for
+USB keyboard/mouse, onboard WiFi, and patched drivers for Realtek USB WiFi
+adapters.
 
-The result is a single flashable `.img` file that boots straight to a working
-launcher + console-mode autologin + opt-in LXDE on HDMI, all reproducible from
-sources.
+Every input is public, pinned, and sha256-verified. No OEM "donor" image is
+needed: M5's own image build ([CardputerZero/pi-gen]) is now entirely open, so
+this script builds the same pieces the same way, on top of Kali's official
+Raspberry Pi image.
+
+| Layer | Source |
+|---|---|
+| Base rootfs | Kali `2026.3` Raspberry Pi arm64 image (kali.download) |
+| Kernel | stock Raspberry Pi `6.18.39+rpt-rpi-v8` .debs from archive.raspberrypi.com — the exact set M5 pins and tests |
+| CZ drivers + overlays | [m5stack/m5stack-linux-dtoverlays] @ `7551854`, compiled inside the image against that kernel (panel, keypad, ES8389 audio + machine driver, bq27220, BMI270/BMM150, m5ioe1, gpio-forwarder, powerfail) |
+| CM0 WiFi firmware | Raspberry Pi `firmware-brcm80211` (the BCM43439 NVRAM with `boardflags3=0x04000000`) |
+| Launcher + apps | [CardputerZero/launcher] `0.6.105` + 13 first-party app releases (Camera, Music, Piano, Recorder, Files, Compass, IR-Chat, IR-Remote, Cap-CC1101 ×2, Cap-LoRa-1262 ×2, Keyboard-Guide) |
+| Camera userspace | Raspberry Pi's libcamera `0.7.2+rpt20261009` (+ libpisp, tflite) and Debian trixie's boost 1.83 / absl, in a private tree used only by the Camera app |
+| Boot splash, LCD→HDMI mirror | `splash.bmp`, `fb-mirror.py` from CardputerZero/pi-gen |
+
+[CardputerZero/pi-gen]: https://github.com/CardputerZero/pi-gen
+[m5stack/m5stack-linux-dtoverlays]: https://github.com/m5stack/m5stack-linux-dtoverlays
+[CardputerZero/launcher]: https://github.com/CardputerZero/launcher
 
 ---
 
 ## TL;DR
 
 ```bash
-# One-time host setup
-sudo pacman -S qemu-user-static qemu-user-static-binfmt \
-               aarch64-linux-gnu-gcc aarch64-linux-gnu-binutils \
-               scons python-parse python-tqdm python-requests
+# One-time host setup (Arch/Manjaro)
+sudo pacman -S qemu-user-static qemu-user-static-binfmt git
 
-# Build the (cached) launcher .deb from upstream source — only when the
-# launcher source changes
-sudo ./graft.sh launcher-build
+# Build (downloads everything into ./cache and the Kali .xz on first run)
+sudo ./graft.sh
 
-# Build the full image (uses the cached .deb)
-sudo ./graft.sh fresh all
+# Flash — refuses non-removable disks, mounted disks, or too-small cards
+sudo FLASH_DEV=/dev/sdX ./graft.sh flash
 
-# Flash
-sudo dd if=kali-linux-2026.1-raspberry-pi-arm64.img \
-        of=/dev/sdX bs=4M status=progress conv=fsync
-
-# Drop your ssh pubkey onto the flashed card (image stays generic)
+# Optional: put your ssh pubkey on the card (image itself stays generic)
 sudo DEPLOY_SSH_DEV=/dev/sdX ./graft.sh deploy-ssh
 ```
 
-Then pull the card, boot, and:
-- **LCD** shows APPLaunch (the M5 launcher) immediately
-- **HDMI** (if plugged) shows a tty1 autologin as `kali`
-- **SSH** `kali@<ip>` works key-only
-
----
-
-## What you need in this directory
-
-| File | Origin | Role |
-|---|---|---|
-| `graft.sh` | this repo | the build/flash/deploy script |
-| `vendored/` | this repo | a patched `cardputerzero-overlay-cs2fix.dtbo` (frees GPIO22 so the LoRa cap works), `lsm6ds3tr-overlay` `.dtbo`/`.dts` (IMU), and the `camera-gpio16-high-overlay.dtbo` / `spk-gpio24-high-overlay.dtbo` we lifted from M5's 2025-05 image |
-| `cache/` | populated at graft time, gitignored | fetched-and-verified upstream tarballs (currently just `zeroclaw-*.tar.gz`, pinned by SHA-256) |
-| `cardputerzero-trixie-arm64-latest.img.xz` | M5Stack's [OSS bucket](https://cardputer-zero-repo.oss-cn-shenzhen.aliyuncs.com/cardputerzero-trixie-arm64-latest.img.xz); `stage_donor` will fetch it automatically | donor for kernel/modules/firmware/overlays — known-good OEM baseline so anyone can reproduce, even if they've tinkered on their CZ |
-| `CardputerZero.img` (optional override) | `dd` of your own stock SD card | use via `CZ_IMG=/path/to/CardputerZero.img` if you want to graft from a field-modified donor instead |
-| `kali-linux-2026.1-raspberry-pi-arm64.img.xz` | https://kali.download/arm-images/ | base rootfs |
-| `M5CardputerZero-Launcher/` | https://github.com/CardputerZero/M5CardputerZero-Launcher | launcher source (auto-detected one level up too, for the workspace layout) |
-| `applaunch_*_arm64.deb` | produced by `launcher-build` | cached prebuilt launcher |
-| `kali-linux-2026.1-raspberry-pi-arm64.img` | produced by `unxz` + `all` | the flashable result |
+On the device:
+- **LCD**: APPLaunch, driven by the built-in keyboard.
+- **HDMI**: LXDE, autologin as `kali`, for USB keyboard/mouse. The built-in
+  keyboard is deliberately ignored by X.
+- **Ctrl-Alt-F2…F6** (USB keyboard): text login on HDMI with your credentials.
+  **Alt-F7** returns to the desktop. tty1 is intentionally dead (see below).
+- **SSH**: `kali@<ip>`, password `kali`, or key-only after `deploy-ssh`.
 
 ---
 
 ## Stages
 
-`graft.sh` is a staged pipeline; you can run any subset.
+Run any subset, e.g. `sudo ./graft.sh configs verify`. The default is `all`.
 
 | Stage | What it does |
 |---|---|
-| `check` | Verify host tooling + input images |
-| `donor` | Fetch the OEM CZ donor .img.xz from M5Stack's bucket if absent, then decompress (skipped if `CZ_IMG` exists) |
-| `unxz` | Decompress Kali base .xz (skipped if .img already exists) |
-| `resize` | Grow Kali rootfs by `$GROW_GB` (default 4 GiB → 18 GiB total) |
-| `mount` | Loop-attach + mount both donor (ro) and Kali (rw) |
-| `boot` | Transplant CZ kernel/dtb + write merged config.txt/cmdline.txt/cloud-init user-data. Copies `cardputerzero-overlay.dtbo` from donor; sources `lsm6ds3tr-overlay.dtbo` from `vendored/` when the donor lacks it (the OEM does) |
-| `rootfs` | Copy CZ kernel modules + CM0 BCM firmware + Cypress NVRAM (incl. BCM43439 boardflags3 fix). Re-runs `depmod` |
-| `applaunch` | Install APPLaunch .deb (prefers `applaunch_*_arm64.deb` from this dir, falls back to donor's). Also creates `/home/pi` and installs `vendored/zeroclaw` there |
-| `launcher-build` | **(opt-in)** Build APPLaunch from `M5CardputerZero-Launcher/` source in a qemu chroot, package as a .deb, cache here. `LAUNCHER_REBUILD=1` to force re-build. |
-| `configs` | Write static configs: glycin no-sandbox env, fbcon disable, X input ignore, X no-glamor, lightdm autologin, /etc/skel, agetty autologin, dbus WorkingDirectory drop-in |
-| `packages` | chroot-apt install `lxde-core`, `lightdm-autologin-greeter`, `zram-tools`, `feh`, `libcamera0.7`; pre-create kali user; set startx default = LXDE; defensive `chmod 755 /` |
-| `tweaks` | NM `managed=true`, mask `networking.service`, write `/etc/hosts` entry |
-| `verify` | Sanity-check every fix landed correctly |
-| `shell` | Mount everything + interactive bash for tinkering |
-| `deploy-ssh` | **(post-flash)** Mount a flashed card and drop your pubkey into `/home/kali/.ssh/authorized_keys` |
-| `fresh` | Delete the current .img so the next run starts from .xz |
-| `all` | Full pipeline (skips `launcher-build` — that's opt-in) |
+| `check` | Verify host tooling (qemu binfmt, git, parted, …) |
+| `fetch` | Download + sha256-verify every pinned input into `cache/` (Kali .xz goes next to the script) |
+| `unxz` / `resize` | Decompress Kali, grow the rootfs by `GROW_GB` |
+| `mount` | Loop-mount the image |
+| `kernel` | chroot: purge nexmon's `brcmfmac` DKMS, install + hold the RPi 6.18.39 kernel/headers, put kernel8.img / CM0 dtb / overlays / initramfs8 on the FAT; install RPi's CM0 WiFi firmware |
+| `drivers` | chroot: build m5stack-linux-dtoverlays (`make CONFIG_CARDPUTERO_V0_5=y install`), udev seat rules, panel autoload, gpio group |
+| `boot` | `config.txt`, `cmdline.txt`, LCD splash |
+| `configs` | glycin, X input-ignore + no-glamor, lightdm autologin, consoles, ALSA, gpsd, zram, Realtek blacklist |
+| `packages` | chroot: LXDE, lightdm, pipewire-pulse, fbset, gpsd, Noto CJK fonts, …; patch + build `88XXau` for 6.18; kali user/groups (incl. `spi`); memory diet |
+| `apps` | chroot: real `apt install` of APPLaunch + apps; linger for `kali`; fb-mirror; private RPi libcamera + `camera_app` wrapper |
+| `tweaks` | NetworkManager, hostname + `/etc/hosts`, first-boot rootfs grow |
+| `verify` | ~100 checks on the finished image |
+| `flash` | `FLASH_DEV=/dev/sdX` — guarded `dd` to a removable card |
+| `deploy-ssh` | `DEPLOY_SSH_DEV=/dev/sdX` — pubkey into `/home/kali/.ssh` |
+| `drift` | Compare our launcher/kernel/driver/Kali pins against upstream's latest |
+| `shell` | Mount + chroot binds + interactive shell |
+| `fresh` | Delete the output .img (next run starts from the .xz) |
 
----
+Stages are idempotent: `kernel` and `drivers` skip their builds when the
+pinned version is already in the image. `packages` skips only when its stamp
+(`/var/lib/cz-graft/packages.rev`) matches `PACKAGES_REV`, so **bump
+`PACKAGES_REV` in `graft.sh` whenever you change `stage_packages`**, or a
+re-run on an existing image silently keeps the old package set.
 
-## Workflows
+## Bumping pins
 
-### A. First-time clean build
+All pins live at the top of `graft.sh`. Run `sudo ./graft.sh drift` to see what
+M5's latest stable image uses. The release notes on CardputerZero/pi-gen list
+the launcher version, kernel version and dtoverlays commit for every image.
 
-```bash
-sudo ./graft.sh launcher-build   # ~15-25 min, downloads SDK on first run
-sudo ./graft.sh fresh all        # ~25 min (unxz + chroot apt is the slow part)
-sudo dd if=kali-linux-2026.1-raspberry-pi-arm64.img \
-        of=/dev/sdX bs=4M status=progress conv=fsync
-sudo DEPLOY_SSH_DEV=/dev/sdX ./graft.sh deploy-ssh
-```
-
-### B. Iterating on the launcher
-
-Edit code in `M5CardputerZero-Launcher/projects/APPLaunch/`, then:
-
-```bash
-sudo LAUNCHER_REBUILD=1 ./graft.sh launcher-build   # ~2-5 min incremental
-```
-
-The new `applaunch_0.1-cz1+g<short-hash>_arm64.deb` gets cached here. Either
-re-build the full image, or scp the new binary directly:
-
-```bash
-scp M5CardputerZero-Launcher/projects/APPLaunch/dist/M5CardputerZero-APPLaunch \
-    kali@<ip>:/tmp/
-ssh kali@<ip> 'sudo systemctl stop APPLaunch && \
-  sudo install -m755 /tmp/M5CardputerZero-APPLaunch \
-       /usr/share/APPLaunch/bin/M5CardputerZero-APPLaunch && \
-  sudo systemctl start APPLaunch'
-```
-
-### C. Iterating on configs only
-
-```bash
-sudo ./graft.sh configs tweaks verify   # ~30 sec; reuses mounted image
-sudo dd ...                              # re-flash
-```
-
-### D. Iterating on packages
-
-```bash
-sudo ./graft.sh packages verify   # ~5 min if apt cache is fresh
-```
-
-### E. Tinkering in a chroot
-
-```bash
-sudo ./graft.sh shell
-# you're now in bash with /mnt/kali_{boot,root} and /mnt/cz_{boot,root} mounted
-# poke around, then `exit` to clean up
-```
-
-### F. Override the launcher .deb
-
-```bash
-sudo APPLAUNCH_DEB=/path/to/some-other-applaunch.deb ./graft.sh applaunch
-```
-
-### G. Use a different host's SSH key
-
-```bash
-sudo DEPLOY_SSH_DEV=/dev/sdX DEPLOY_SSH_PUBKEY=/path/to/key.pub \
-     ./graft.sh deploy-ssh
-```
-
----
+- **Kernel**: copy the v8 lines of pi-gen's
+  `stage0/02-firmware/files/kernel-packages.sha256` into `KERNEL_DEBS`, set `KVER`,
+  then run `sudo ./graft.sh fresh all`. The drivers must be rebuilt against the
+  new headers.
+- **Drivers**: `DTOVERLAYS_COMMIT`.
+- **Apps**: URL + sha256 in `CZ_DEBS`.
+- **Kali**: `KALI_VER` + `KALI_SHA256` (from that release's `SHA256SUMS`).
 
 ## Environment overrides
 
 | Var | Default | Effect |
 |---|---|---|
-| `CZ_IMG` | `$SCRIPT_DIR/cardputerzero-trixie-arm64-latest.img` | Decompressed donor .img. **For the camera userspace lift to work, point this at M5Stack's `20250513_os.img` (or newer)** — the older `cardputerzero-trixie-arm64-latest` donor lacks `libcamera-ipa`. |
-| `CZ_XZ` | `$SCRIPT_DIR/cardputerzero-trixie-arm64-latest.img.xz` | Donor .img.xz. If neither `CZ_IMG` nor `CZ_XZ` exists, `stage_donor` downloads from `CZ_URL`. |
-| `CZ_URL` | M5Stack OSS bucket URL for the OEM image | Source for the fetch step. The default points at the older `-latest` build; for the camera-capable donor, fetch `https://m5stack.oss-cn-shenzhen.aliyuncs.com/resource/linux/cp0/20250513_os.img.zip` manually and `unzip` it. |
-| `KALI_XZ` | `$SCRIPT_DIR/kali-linux-2026.1-raspberry-pi-arm64.img.xz` | Base rootfs .xz |
-| `OUT_IMG` | `${KALI_XZ%.xz}` | Output .img path |
-| `APPLAUNCH_DEB` | (auto: prefers most recent `$SCRIPT_DIR/applaunch_*.deb`, falls back to donor's) | Specific .deb to install |
-| `LAUNCHER_SRC` | auto-detect (`$SCRIPT_DIR/M5CardputerZero-Launcher`, then `$SCRIPT_DIR/../M5CardputerZero-Launcher`) | Launcher source tree for `launcher-build` |
-| `ZEROCLAW_VER` | `v0.7.5` | zeroclaw release tag to fetch |
-| `ZEROCLAW_SHA256` | (matches v0.7.5 aarch64-linux-gnu tarball) | Required-match SHA-256 of the fetched tarball |
-| `ZEROCLAW_URL` | GitHub release for `$ZEROCLAW_VER` | Override the fetch URL (e.g. a mirror) |
-| `ZEROCLAW_CACHE` | `$SCRIPT_DIR/cache/zeroclaw-aarch64-unknown-linux-gnu.tar.gz` | Where to cache the fetched tarball |
-| `CZ_HOSTNAME` | `cardputerzero-kali` | Hostname baked into cloud-init |
-| `GROW_GB` | `4` | Extra GiB added to rootfs |
-| `LAUNCHER_REBUILD` | `0` | If `1`, `launcher-build` re-runs even if a .deb at this commit is cached |
-| `DEPLOY_SSH_DEV` | (required for `deploy-ssh`) | Block device of the flashed card |
-| `DEPLOY_SSH_PUBKEY` | `~/.ssh/id_ed25519.pub` | Pubkey file to deploy |
+| `KALI_VER`, `KALI_URL`, `KALI_SHA256`, `KALI_XZ` | 2026.3 | Kali base image |
+| `OUT_IMG` | `KALI_XZ` minus `.xz` | Output image |
+| `CACHE` | `./cache` | Download cache |
+| `DTOVERLAYS_COMMIT` | `7551854…` | Driver source revision |
+| `CZ_HOSTNAME` | `cardputerzero-kali` | Hostname |
+| `GROW_GB` | `4` | Extra GiB in the rootfs (first boot grows it to fill the card anyway) |
+| `FLASH_DEV` | — | Target for `flash` |
+| `DEPLOY_SSH_DEV`, `DEPLOY_SSH_PUBKEY` | —, `~/.ssh/id_ed25519.pub` | `deploy-ssh` |
 
 ---
 
-## What's in the produced image
+## Design notes (the sharp edges)
 
-### Hardware (from the CZ donor)
+- **Keyboard sharing and the consoles.** Upstream APPLaunch deliberately
+  doesn't `EVIOCGRAB` the keypad, so the apps it launches can read it too. The
+  kernel VT keyboard therefore also sees every keypress and types into the
+  foreground VT. tty1 therefore has no getty at all (`getty@tty1` and
+  `autovt@tty1` are masked). X runs on its own VT, where the kernel keyboard is
+  off. tty2–6 are ordinary credentialed logins via logind's autovt.
+- **No kernel console on the LCD.** `fbcon=map:99` binds the console to no
+  framebuffer at boot. A udev rule then maps tty2–6 onto the HDMI framebuffer
+  (`vc4drmfb`) only, via `con2fbmap`, so the LCD stays APPLaunch-only whatever
+  the fb probe order. *Needs confirming on hardware.* If tty2 is blank on HDMI,
+  this is where to look.
+- **APPLaunch is a user unit.** Its postinst enables it for UID 1000. A linger
+  file (`/var/lib/systemd/linger/kali`) starts kali's user manager, and with it
+  APPLaunch, at boot without anyone logging in.
+- **Kernel install in a chroot.** Kali's `z50-raspi-firmware` hook looks for
+  DTBs under `/usr/lib/linux-image-<ver>/`, while RPi's 6.18 packages ship them
+  under `/usr/lib/modules/<ver>/dtb/`, so the script bridges the path with a
+  symlink. The DKMS kernel hooks are paused during the install so Kali's
+  6.12-only Realtek DKMS packages can't abort it.
+  `brcmfmac-nexmon-dkms` is purged: it has no BCM43439 support, and its
+  `updates/dkms/brcmfmac.ko` would shadow the driver the onboard WiFi needs.
+- **CM0 WiFi firmware.** The `brcm/` and `cypress/` trees from Raspberry Pi's
+  `firmware-brcm80211` .deb are copied over Kali's files; the package itself
+  isn't installed. On Kali those paths belong to `firmware-nexmon`.
+- **Holds.** The RPi kernel packages and `raspi-firmware` are `apt-mark hold`,
+  and so is whichever firmware package owns the brcm/cypress files
+  (`firmware-nexmon` on Kali; `verify` fails if one is installed but not
+  held). A routine `apt upgrade`
+  would otherwise replace the kernel the CZ modules are built for, or put back
+  Kali's wrong BCM43439 NVRAM. To refresh one deliberately: `apt-mark unhold`,
+  install it, then hold it again.
+- **Realtek USB WiFi.** `realtek-rtl88xxau-dkms` is limited to 6.12. Its
+  sources are patched for 6.16–6.18 API changes (timer API, `radio_idx`,
+  `ccflags-y`) and built for 6.18. The in-tree `rtw88_88xxa` drivers are
+  blacklisted so `88XXau` wins for the AWUS036ACS.
+- **Low-RAM survival.** zram at 75%, a memory diet on autostarts. glycin's
+  sandbox is bypassed and its thumbnailers diverted, because they livelock or
+  pile up on aarch64. Xorg uses no glamor (V3D `-ENOMEM` on
+  512 MB).
+- **Bluetooth stays enabled.** The CM0's CYW4343A2 (hci0) works, and
+  APPLaunch polls bluez every 2 s. Masking `bluetooth.service` while the
+  `dbus-org.bluez.service` alias remains made every poll log "failed to load
+  properly … File exists", flooding the journal. `verify` fails if it's masked.
+- **systemd 259 + dbus**: `WorkingDirectory=/` drop-in (messagebus home is
+  `/nonexistent`). `stage_verify` also guards `/` against mode 700.
+- **ttyS0 belongs to the LoRa+GNSS cap.** There's no serial console on it (no
+  `console=serial0` in cmdline.txt, `serial-getty@ttyS0` masked): M5's GPS app
+  opens the port itself and refuses one assigned to a console. gpsd is
+  configured for it (115200) but **socket-activated only**, without `-n`, so it
+  holds the port only while a client (kismet, cgps, …) is watching. The GPS
+  app and gpsd clients can each use the cap, just not at the same time.
+- **Camera** uses Raspberry Pi's libcamera fork, because M5's CameraApp links
+  Pi-only symbols (`properties::PixelArrayReadableArea`, …) that Kali's
+  upstream libcamera 0.7.2 lacks. It's the same soname, so it lives in a private
+  tree, `/opt/rpi-libcamera`. `/usr/bin/camera_app` is dpkg-diverted to
+  `/usr/lib/cz-graft/camera_app.real` and replaced by a wrapper that points
+  the loader and libcamera's IPA, proxy, tuning and pipeline paths there.
+  Kali's own libcamera is untouched.
+- **spidev** gets `GROUP="spi"` from Raspberry Pi's udev rules, but Kali has no
+  `spi` group, so the node silently stayed `root:root 0600` and the LoRa app
+  couldn't open it. The group is created and kali is added to it. `verify`
+  now checks that every group named by a udev `GROUP=` exists.
+- **cloud-init never runs** on Kali 2026.3's Pi image: ds-identify finds no
+  datasource. The user, hostname, ssh and rootfs grow are therefore baked in
+  directly, and `/boot/firmware/user-data` is no longer written. `tweaks` sets
+  `/etc/hostname` and the `127.0.1.1` line in `/etc/hosts` to `CZ_HOSTNAME`
+  (the base image otherwise boots as `kali-raspberry-pi`).
+- **Fonts.** M5's apps load Noto CJK by absolute path
+  (`/usr/share/fonts/opentype/noto/NotoSansCJK-*.ttc`), so `fonts-noto-cjk`
+  is installed.
+- **ALSA default** routes to `hw:1,0` through softvol. *Re-check on hardware*:
+  M5's driver set now includes a `cardputerzero-audio` machine driver and the
+  image runs pipewire, so the card index and the need for softvol may have
+  changed.
 
-- M5-patched Raspberry Pi kernel 6.12.75 with all `m5stack,*` device-tree overlays
-- M5 kernel modules: `st7789v_m5stack`, `tca8418_keypad_m5stack`, `es8389_m5stack`, `pwm_bl_m5stack`, `py32ioexp`
-- `cardputerzero-overlay.dtbo`, `lsm6ds3tr-overlay.dtbo`
-- BCM43439 WiFi firmware **with the right `boardflags3=0x04000000` NVRAM** (Kali's stock NVRAM hangs the chip on this carrier)
-- CM0-specific Broadcom firmware blobs
+## Hardware status
 
-### Desktop & UX
+Tested on a v5 board with the image as built by this script:
 
-- **APPLaunch** running on `/dev/fb1` (LCD), service auto-restart with `systemd-udev-settle` wait
-- **agetty autologin** as `kali` on tty1 (visible on HDMI when plugged)
-- **LXDE + lightdm auto-enabled** so HDMI lights up at boot (~164 MB available with desktop running on a 415 MB usable CM0). Xorg ignores the integrated keypad so APPLaunch keeps control on the LCD; HDMI session is for USB peripherals only. Mask `lightdm.service` to recover the ~80 MB if you don't want it.
-- `update-alternatives x-session-manager → startlxde` so `startx` lands in LXDE too
-- Kali wallpaper baked into pcmanfm's system-default config
-
-### System
-
-- `zramswap` enabled at 75% of RAM (~311 MB compressed swap on the CM0)
-- `NetworkManager` configured with `[ifupdown] managed=true`; `networking.service` masked
-- `kali` user pre-created with password `kali` + NOPASSWD sudo
-- SSH key **NOT** baked in (use `deploy-ssh` post-flash)
-- `bluetooth.service` masked (~10 MB saved); blueman/xfce4-*/orca/etc autostarts disabled (memory diet)
-
-### Workarounds baked in (sharp edges of the platform)
-
-- `GLYCIN_SANDBOX_MECHANISM=not-sandboxed` written to three places — `/etc/environment` (consumed by `pam_env` for X sessions and SSH), `/etc/environment.d/` (consumed by `systemd --user`), and `/etc/profile.d/` (consumed by login shells). Glycin's bwrap sandbox crashes on every aarch64 Pi image with OOM, which kills Gtk apps that try to load icons (panel/greeter/pcmanfm). pcmanfm's wallpaper load fails specifically and the LXDE desktop is solid black without this
-- `xset s off; xset -dpms; xset s noblank` in `/etc/xdg/lxsession/LXDE/autostart` — X's default 10-minute screen blank + DPMS timeout looks like a regression when HDMI goes dark mid-demo. Device is intended for always-on / kiosk-like use
-- `fbcon=map:99` in cmdline.txt suppresses the kernel framebuffer console entirely so APPLaunch owns the LCD solo. (A userspace unbind service was tried first but raced the `st7789v_m5stack` driver — fired before the fb registered, missed it, and the kernel auto-rebound. Side effect: HDMI text console is no longer visible — use SSH or `sudo systemctl start lightdm` for HDMI shells.)
-- Xorg `40-cardputerzero-no-grab.conf` makes X ignore the integrated TCA8418 keypad + IR receiver (APPLaunch grabs them exclusively via EVIOCGRAB in our rebuilt launcher)
-- `APPLaunch.service.d/wait-for-udev.conf` — APPLaunch races udev for `/dev/input/by-path/platform-3f804000.i2c-event`; the drop-in busy-waits up to 10 s
-- `dbus.service.d/workdir.conf` — systemd 259+ chdir-to-User=home semantics break dbus (messagebus has home `/nonexistent`); explicit `WorkingDirectory=/`
-- Defensive `chmod 755 /` + verify check — past chroot accidents have left `/` mode 700, which silently breaks every non-root service via libselinux.so.1 EACCES cascade
-- `apt-mark hold` on `raspi-firmware`, `firmware-misc-nonfree`, `firmware-linux`, `firmware-linux-nonfree`, `kali-linux-firmware`, `linux-image-rpi-v8`, `linux-image-rpi-2712` — Kali is rolling, so `apt upgrade` is a daily reality, but those packages own `/boot/firmware/kernel8.img`, the dtb, the Cypress NVRAM, and the kernel binary. Letting them upgrade replaces our M5-patched 6.12.75 kernel and breaks `st7789v_m5stack.ko` / `tca8418_keypad_m5stack.ko` ABI, killing the LCD + keypad. To intentionally pull a refresh: `sudo apt-mark unhold <pkg>; sudo apt install <pkg>` then re-hold.
-- `Xorg 98-vc4-no-glamor.conf` (`AccelMethod=none` + `ShadowFB=true`) — glamor's V3D tile-binning path hits `-ENOMEM` under load on the 512 MB Pi Zero 2 W (`AddScreen/ScreenInit failed for driver 0`). Software shadow-fb rendering is slow but actually puts pixels on the screen. `cma=384M` was tried and *bricks* the kernel — it leaves <60 MB for everything else
-- Fetch + SHA-verify zeroclaw (Apache 2.0, [`zeroclaw-labs/zeroclaw`](https://github.com/zeroclaw-labs/zeroclaw)) at install time and extract to `/home/pi/zeroclaw` + `/home/pi/web/` — APPLaunch's Claw app shells out to a hardcoded `/home/pi/zeroclaw agent`; the OEM image's `/home/pi` is empty, so Claw immediately exits with "Press any key" without this helper present. Pinned to `v0.7.5` via `ZEROCLAW_VER` / `ZEROCLAW_SHA256` env vars. Other hardcoded paths (`roller485`, `M5CardputerZero-Calculator-linux-aarch64`, `start_mft2023_unified_racer.sh`, `zhou.wav`) need similar treatment but we don't have authoritative sources for them yet — those apps fail similarly until someone supplies the binaries
-- **`gpsd` preconfigured for the LoRa+GNSS cap's onboard GPS.** `/etc/default/gpsd` points at `/dev/ttyS0` @ 115200 — the baud M5 pre-configures the ATGM336H to (factory default is 9600, but they bumped it to match the Pi's console rate). `serial-getty@ttyS0` is masked so getty doesn't grab the UART before gpsd can claim it at boot. Kernel boot console still uses `ttyS0` for OUTPUT (no read contention with gpsd; both at 115200), so serial boot debugging is unaffected. `cgps`, `gpspipe`, and kismet's `gps=gpsd:` integration all Just Work. Plug in the cap, give it sky-view, get a fix in 30-90 sec — sometimes immediately even indoors (M5's antenna is surprisingly sensitive). Pocket wardriving rig: `sudo kismet -c wlan1` and the resulting `.kismet` file's packets carry per-packet GPS coordinates that `kismetdb_to_wiglecsv` / `kismetdb_to_kml` consume directly.
-- **Patched `cardputerzero-overlay.dtbo` to free GPIO22 for the LoRa cap.** M5's stock overlay declares 3 SPI0 chip-selects (`num-cs = <0x03>`) with CS2 mapped to GPIO22, but no overlay node consumes CS2 — it's dead-weight pin reservation. This collides with M5's own Ultimate-Edition LoRa SX1262 cap, whose BUSY signal is GPIO22; the LoRa applet's `busy_gpio_init` fails with `rc=1` because the SPI subsystem has already claimed the pin. We decompile their `.dtbo`, drop `num-cs` to 2, remove the third `cs-gpios` triplet, clean up the matching `__fixups__` entry, recompile, and install ours at boot. Diff is ±4 lines, no other functional change; LCD/keypad/audio/I²C all bit-identical. Donor's original is kept on the boot FAT as `cardputerzero-overlay.dtbo.m5orig` for one-`cp` revert if some unforeseen consumer of CS2 ever shows up. **Should be fixed upstream by M5Stack** — flagged on the kernel-source ask list.
-- **`/etc/asound.conf` routes `default` at `hw:1,0` via a softvol plugin.** Two ALSA cards register at boot: card 0 is `vc4hdmi` (no physical HDMI sink on the CZ, opens fail with `ENOSTR` -524), card 1 is the ES8389 codec driven by `es8389_m5stack.ko` + the cardputerzero-overlay's I2S wiring. Without our `asound.conf`, ALSA's stock `default` resolver tries to find a `cards.pcm.front` entry for the M5-custom codec (which doesn't exist) and every audio app fails with `Unknown PCM cards.pcm.front`. The `softvol` plugin layer also synthesizes a "Master" mixer control — the M5 kernel module exposes no native volume controls, so without softvol `alsamixer` would show an empty `Item:` line. To persist your dialed levels: `sudo alsactl store 1` after setting them once. **Tip:** the codec's `DACL` / `DACR` controls in alsamixer are the real hardware volume (default ~30%); push them up if Master at 100% still sounds quiet.
-- **No kernel driver for the bq27220 fuel gauge.** Three things conspire: (1) M5Stack ships `CONFIG_BATTERY_BQ27XXX=n` in the OEM kernel; (2) mainline Linux has no in-tree driver for the bq27220 specifically (only related chips); (3) the chip's data flash is shipped with TI eval-kit defaults (`DesignCapacity = 3000 mAh` vs the actual 1200 mAh FLY 103040 cell), so its on-chip Impedance Track SOC is unreliable regardless. Earlier builds shipped an out-of-tree `bq27xxx_battery.ko` that bound the chip as `ti,bq27500` — wrong register map, returned junk readings, and was a binary we couldn't rebuild from source. We now drop both the kernel module and the `bq27220` overlay entirely. APPLaunch talks to the chip directly via `/dev/i2c-1` with the correct bq27220 register layout (see `projects/APPLaunch/main/hal/linux/hal_settings_linux.cpp`) and computes SOC from a Li-ion OCV curve, since the chip's own SOC register can't be trusted without a proper bqStudio data-flash flash. `/etc/modules-load.d/i2c-dev.conf` ensures `/dev/i2c-1` exists at boot
-
----
-
-## Known upstream defects (no fix here yet)
-
-Issues with M5Stack's stock OEM image we inherit and can't currently work around:
-
-- ~~Camera applet shows black / no frames.~~ **FIXED in this image** (as of 2026-05-27): M5Stack's May 2025 OEM image added a `camera-gpio16-high-overlay` that drives GPIO16 high at DT-init time to power the IMX219 sensor's regulator, and our `stage_rootfs` now lifts M5's `libcamera-ipa` + Pi-patched `libcamera 0.7.0` + TFLite/absl/farmhash/cpuinfo deps from the donor (Kali rolling doesn't package the IPA). **Requires the 2025-05-13 (or newer) donor image** — `CZ_IMG=/path/to/20250513_os.img`. With the older `cardputerzero-trixie-arm64-latest` donor, verify fails because the donor lacks `libcamera-ipa` entirely
-- **`pigpio` not packaged in Kali rolling.** The launcher's GPIO app shells out to `pigs prs/pfs/p ...` (pigpio's shell client) which requires the `pigpio` package + a running `pigpiod`. Kali drops it on security grounds (pigpio mmap's `/dev/mem`). The GPIO app's PWM tab silently no-ops. Workaround paths: (a) build pigpio from source in `stage_packages`, (b) port the launcher's GPIO app to libgpiod (we install `gpiod` so `gpioset/gpioget/gpioinfo` are available for digital I/O). Neither attempted yet.
-- **Several launcher apps shell out to `/home/pi/...` binaries that don't exist in either our image or M5Stack's OEM** — we don't have authoritative public sources for them so they aren't vendored:
-  - `/home/pi/roller485` — MIDI app's roller-motor controller
-  - `/home/pi/start_mft2023_unified_racer.sh` — LOVYAN/racer game launcher script
-  - `/home/pi/zhou.wav` — startup chime played via `tinyplay -D1 -d0`
-  - `/home/pi/M5CardputerZero-Calculator-linux-aarch64` — Calculator. The `projects/Calculator/` submodule does exist upstream; vendoring its build the same way we do AppStore is a future TODO.
-
-  These cause the corresponding apps to spawn-fail silently (return to the rotor with no error). All non-blocking — every other app works.
-
----
-
-## Sharp edges of building
-
-- **You need `qemu-user-static-binfmt` registered before stage_packages runs.** systemd-binfmt does this automatically once the package is installed.
-- **The chroot apt install pulls ~700 MB of packages and runs for ~5-10 min on this laptop.** Fast SSDs help; the device's CM0 takes ~50 min for the same install at first boot, which is why we bake it in.
-- **`fresh all` deletes the .img and starts over.** Re-run when you change `stage_unxz` / `stage_resize` related things. For everything else, run only the stages you changed.
-- **The launcher build downloads ~500 MB of SDK static libs on first invocation** (cached under `M5CardputerZero-Launcher/SDK/github_source/`). Subsequent builds reuse them.
-
----
-
-## Source patches we maintain
-
-These live in `M5CardputerZero-Launcher/` as edits on top of upstream HEAD. They
-fail loudly when upstream rebases over them — re-apply as needed.
-
-| File | Why |
+| Works | Notes |
 |---|---|
-| `projects/APPLaunch/main/hal/keyboard_input.c` | `ioctl(fd, EVIOCGRAB, 1)` in `open_restricted` so the kernel VT layer can't also fan out keypad input to tty1 (was double-typing into HDMI shell while in APPLaunch) |
-| `projects/APPLaunch/main/hal/battey.c` | `_battery_timer_cb` signature `int *` → `void *` for `thpool_add_work`; GCC 15 makes incompatible-pointer-types a hard error |
-| `projects/APPLaunch/main/SConstruct` | Replace non-existent `pkg_config_cflags("libcamera")` with a real `subprocess.check_output(['pkg-config', '--cflags', 'libcamera'])` |
+| LCD splash, APPLaunch, lock screen, keypad | |
+| Onboard WiFi, Bluetooth, battery gauge, 5V GPIO, Settings | |
+| Camera (imx219) | live preview via the private libcamera |
+| Compass and the other APPLaunch apps | |
+| LoRa-1262 cap | SX1262 initialises, radio + frequency shown |
+| LoRa-1262 GPS | UART opens and NMEA arrives ("searching" indoors) |
 
----
+| Not working / untested | Notes |
+|---|---|
+| IR transmit | No LED output; see the known gaps below |
+| IR receive | Captures fine |
+| CC1101 NFC / Sub-GHz caps | Not tested (no hardware) |
+| HDMI tty2 mapping, ALSA routing | See the design notes above; not re-checked |
+
+## Not included / known gaps
+
+- **FactoryTest** is skipped. It's M5's factory QA tool, and it hard-depends
+  (via apt) on Raspberry Pi's libcamera packages.
+- **IR Remote replay of long captures.** The kernel rejects a single LIRC
+  transmit longer than 500 ms in total (`IR_MAX_DURATION`), and IR-Remote 0.1.4
+  replays the whole capture, including every repeat frame recorded while the
+  button was held. Those sends fail with `EINVAL`. Tap the remote briefly when
+  recording, and delete long captures. This is an upstream app bug
+  (`src/models/ir_service_model.cpp` sends everything after the leading gap).
+- **IR transmit shows no LED output** on the test unit, even with short
+  captures the kernel accepts (`sent pulses=271` in the journal). GPIO12 is
+  owned by `gpio-ir-tx` and is driven high during a send (sampled with
+  `pinctrl lev 12`), and the config matches M5's (`gpio-ir-tx,gpio_pin=12`).
+  Forcing GPIO12 high by hand, with or without the Grove 5V rail, also lit
+  nothing in a phone camera. That points at the board's LED path rather than
+  the image, but it hasn't yet been compared against M5's stock image.
+- **`rtl88x2bu` (RTL8812BU/8822BU)**: the `packages` stage calls the build
+  for it, but `realtek-rtl88x2bu-dkms` isn't installed, so it only logs
+  `WARNING: source (none) … not found`. Only `88XXau` is built.
+- **LaunchWizard** (M5's first-boot OOBE) is installed but not enabled.
+  APPLaunch starts directly.
+- **GPU-firmware boot splash**: M5 ships a custom `start.elf`/`fixup.dat` that
+  draws a splash before Linux starts. It's closed-source and cosmetic, so it
+  isn't used. The Linux-side `fb_load` splash is installed.
+- **Internal WiFi monitor mode**: nexmon has no BCM43439 port. Use a USB
+  adapter.
 
 ## Troubleshooting
 
-### Just-flashed card boots to broken HDMI text login loop
-
-Pull the card and check `/dev/sdX2/etc/passwd` for the kali user — if it's
-missing, `stage_packages` didn't run (or skipped via stale sentinel). Re-run
-`sudo ./graft.sh packages`.
-
-### `chmod 755 /` regression
-
-`stage_verify` catches this now. If it ever slips through and you see "everything
-broken" on first boot, mount the rootfs from the laptop and `sudo chmod 755 /mnt/.../`.
-
-### Cursor drift in launcher CLI
-
-Was upstream bug in older launcher versions. Run `launcher-build` against a
-fresh `M5CardputerZero-Launcher` HEAD — the fix is upstream now.
-
-### Launcher build fails with `jpeglib.h: No such file`
-
-Your chroot's apt-install of `libjpeg-dev` failed. Re-run `launcher-build` —
-it'll re-attempt.
-
-### Launcher build fails with `libcamera/camera.h: No such file`
-
-Confirm your patched `projects/APPLaunch/main/SConstruct` is still in place with
-the subprocess pkg-config call. See "Source patches" above.
-
-### `ssh kali@<ip>` asks for password
-
-You haven't run `deploy-ssh` yet, OR your pubkey isn't where the script looks for
-it. Either run `sudo DEPLOY_SSH_DEV=/dev/sdX DEPLOY_SSH_PUBKEY=/path/to/key.pub
-./graft.sh deploy-ssh`, or `ssh-copy-id kali@<ip>` interactively after the first
-password login.
-
-### "Permission denied" on `runuser -u messagebus /bin/bash` after boot
-
-Almost certainly `/` got chmod'd to 700 somewhere. `chmod 755 /` and reboot. The
-`stage_verify` check should prevent this in the first place; if you're seeing
-it post-graft, the verify isn't matching reality — file a bug against this script.
-
----
+- **LCD backlight on, nothing drawn**: `lsmod | grep panel_mipi_dbi_m` and
+  `ls /dev/fb_lcd`; `journalctl --user -u APPLaunch` (as kali).
+- **APPLaunch not running at boot**: is `/var/lib/systemd/linger/kali` present?
+  Check `loginctl show-user kali | grep Linger`.
+- **No wlan0**: `dmesg | grep brcmf`. "HT Avail timeout" means the wrong NVRAM.
+  Check `grep boardflags3 /lib/firmware/cypress/cyfmac43439-sdio.txt`.
+- **`ssh kali@<ip>` asks for a password**: run `deploy-ssh`, or `ssh-copy-id` once.
+  After reflashing, the host key changes: `ssh-keygen -R <ip>`.
+- **Camera app won't start**: `ldd /usr/lib/cz-graft/camera_app.real` under
+  the wrapper's `LD_LIBRARY_PATH`. An undefined `libcamera::properties::…`
+  symbol means it's loading Kali's libcamera, not `/opt/rpi-libcamera`.
+- **GPS "Could not open GPS power or UART"**: check for `console=serial0` in
+  `/boot/firmware/cmdline.txt`, and whether gpsd holds the port
+  (`fuser /dev/ttyS0`). Stop gpsd's clients first.
+- **LoRa "SX1262 Not initialized"**: `ls -l /dev/spidev0.*` should show group
+  `spi`, and `id kali` should include it.
+- **IR Remote "LIRC write failed: Invalid argument"**: the capture is longer
+  than 500 ms. Re-record with a short tap.
+- **Everything is "permission denied" after boot**: `/` lost mode 755. Run
+  `chmod 755 /`.
 
 ## Lineage
 
-This script started as a 100-line graft to get one test image booting and grew
-as we hit each new bug on real hardware: BCM43439 NVRAM, glycin sandbox on
-aarch64, systemd 259 user-home chdir, fbcon vs APPLaunch fb1 racing, the
-TCA8418 keypad bleeding into X, etc. Each lesson is encoded as either a config
-write, a chroot operation, or a `vfail` check.
+This started as a 100-line graft that copied M5's closed, prototype-era
+kernel, modules and firmware out of their OEM image onto Kali. Once M5 opened
+the whole stack, the donor image went away. Each lesson from real hardware
+(BCM43439 NVRAM, glycin on aarch64, systemd 259 + dbus, fbcon vs APPLaunch,
+keypad sharing, etc.) is still encoded as a config write, a chroot step, or a
+`vfail` check.
